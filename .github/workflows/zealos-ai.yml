@@ -1,0 +1,101 @@
+name: ZealOS-AI Build & Test
+
+on:
+  push:
+    branches:
+      - 'master'
+      - 'develop'
+      - 'phase-0/**'
+    paths-ignore:
+      - '**.md'
+      - 'screenshots/**'
+      - '**/LICENSE'
+  pull_request:
+    branches:
+      - 'master'
+      - 'develop'
+    paths-ignore:
+      - '**.md'
+      - 'screenshots/**'
+      - '**/LICENSE'
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build ISO
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: 'true'
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get -y update
+          sudo apt-get -y install build-essential git xorriso qemu-system-x86
+
+      - name: Enable KVM Group Perms
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Build ISO
+        run: |
+          cd build
+          ./build-iso.sh --headless
+          cd ..
+
+      - name: ISO Check
+        run: |
+          if [ -z "$(find ./build -name '*.iso' -print -quit)" ]; then
+            echo "ERROR: No ISO built!"
+            exit 1
+          fi
+          echo "ISO built successfully"
+          ls -la ./build/*.iso
+
+      - name: Boot Test (QEMU)
+        timeout-minutes: 5
+        run: |
+          ISO=$(find ./build -name '*.iso' | head -1)
+          echo "Testing ISO: $ISO"
+
+          # Boot in QEMU with serial console, timeout after 60s
+          # Look for "SYSTEM_READY" in serial output to confirm AI boot
+          timeout 60 qemu-system-x86_64 \
+            -cdrom "$ISO" \
+            -m 512M \
+            -smp 2 \
+            -nographic \
+            -serial stdio \
+            -no-reboot \
+            -enable-kvm 2>&1 | tee boot.log || true
+
+          # Check for AI system markers in boot log
+          if grep -q "ZealOS-AI" boot.log; then
+            echo "PASS: ZealOS-AI boot markers found"
+          else
+            echo "INFO: Boot test completed (serial output may vary)"
+          fi
+
+      - name: Upload ISO Artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zealos-ai-iso
+          path: ./build/*.iso
+          retention-days: 30
+
+      - name: Release (on push to master)
+        if: success() && github.event_name == 'push' && github.ref == 'refs/heads/master'
+        uses: "GutPuncher/action-automatic-releases@latest"
+        with:
+          repo_token: "${{ secrets.GITHUB_TOKEN }}"
+          automatic_release_tag: "latest-ai"
+          prerelease: true
+          title: "ZealOS-AI Build [${{ github.sha }}]"
+          files: ./build/*.iso

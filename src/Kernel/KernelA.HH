@@ -15,6 +15,7 @@ extern class CHeapCtrl;
 extern class CIntermediateCode;
 extern class CJobCtrl;
 extern class CTask;
+extern class CAgentMeta; //ZealOS-AI: forward declaration for CTask.agent_meta
 
 #define NULL		0
 #define TRUE		1
@@ -47,9 +48,9 @@ extern class CTask;
 #define F64_MAX 	(0x7FEFFFFFFFFFFFFF(F64))
 #define F64_MIN 	(0xFFEFFFFFFFFFFFFF(F64))
 #define inf 		(0x7FF0000000000000(F64))
-#define ∞ 			(0x7FF0000000000000(F64))
+#define ∩┐╜ 			(0x7FF0000000000000(F64))
 #define pi			(0x400921FB54442D18(F64))
-#define π 			(0x400921FB54442D18(F64))
+#define ∩┐╜ 			(0x400921FB54442D18(F64))
 #define exp_1 		(0x4005BF0A8B145769(F64)) //The number "e"
 #define log2_10 	(0x400A934F0979A371(F64))
 #define log2_e		(0x3FF71547652B82FE(F64))
@@ -1695,7 +1696,7 @@ public class CAutoCompleteDictGlobals
 #define OPTf_KEEP_PRIVATE 			7
 #define OPTf_NO_REG_VAR 			8	//Applied to functions, not statements
 #define OPTf_GLOBALS_ON_DATA_HEAP 	9
-//Disable 10-byte float consts for π,log2_10,log10_2,loge_2
+//Disable 10-byte float consts for ∩┐╜,log2_10,log10_2,loge_2
 #define OPTf_NO_BUILTIN_CONST 		10	//Applied to functions, not statements
 #define OPTf_USE_IMM64				11	//Not completely implemented
 #define OPTf_DECIMAL_ONLY			12	//Only allow decimal numbers (no 0x or 0b prefixed numbers)
@@ -2708,7 +2709,7 @@ class CPCIDev
 //Physical Region Descriptor Table
 #define AHCI_PRD_MAX_BYTES		(4 * 1024 * 1024) //Max bytes that can go in one PRD entry ($ER$4 MiB). Section 4.2.3.3 Fig. 17 (DBC) 
 #define AHCI_PRDT_MAX_BLOCKS	(U16_MAX + 1) 	  //Max blocks you can transfer in one command. 
-#define AHCI_PRDT_MAX_LEN		8 				  //Max PRD entries in one command. This is equal to (MAX_BLOCKS * BLK_SIZE) ÷ MAX_BYTES.
+#define AHCI_PRDT_MAX_LEN		8 				  //Max PRD entries in one command. This is equal to (MAX_BLOCKS * BLK_SIZE) ∩┐╜ MAX_BYTES.
 
 //Global Host Control (Controller) flags
 #define AHCI_GHCf_HBA_RESET			0
@@ -4103,6 +4104,9 @@ public class CTask //The Fs segment register points to current CTask.
 	CWinScroll		 horz_scroll, vert_scroll;
 
 	I64				 user_data;
+
+	//ZealOS-AI: Agent metadata pointer (NULL for non-agent tasks)
+	CAgentMeta		*agent_meta;
 #assert !($$ & 7)
 };
 
@@ -4564,5 +4568,571 @@ class CProgress
 #define PRINTF_NEG					0x200
 #define PRINTF_NEG_E				0x400
 #define PRINTF_NEG_AUX_FORMAT_NUM	0x800
+
+//=============================================================================
+// ZealOS-AI: Agent Operating System Extensions
+// Phase 0 ΓÇö Agent as Kernel Object
+//=============================================================================
+
+#help_index "AI/Agent"
+
+//--- Agent Scheduling (absorbs AitherOS AgentKernel + SlotPool) ---
+
+#define AGENT_MAX_AGENTS		64
+#define AGENT_MAX_TASKS			16  //per agent
+#define AGENT_TICK_JIFFIES		(30 * 18) //30 seconds at ~18.2 Hz PIT
+#define AGENT_NAME_LEN			32
+#define AGENT_MAX_SKILLS		16
+
+#define AGENTf_ACTIVE			0
+#define AGENTf_SUSPENDED		1
+#define AGENTf_CAN_SPAWN		2
+#define AGENTf_CAN_DELEGATE		3
+#define AGENTf_SANDBOXED		4
+#define AGENTf_HEALING			5
+
+#define AGENT_ROLE_ORCHESTRATOR	0
+#define AGENT_ROLE_WORKER		1
+#define AGENT_ROLE_MONITOR		2
+#define AGENT_ROLE_SECURITY		3
+#define AGENT_ROLE_SPECIALIST	4
+
+public class CAgentTask
+{
+	I64		 id;
+	I64		 effort;		//1-10
+	I64		 interval;		//jiffies between runs, 0=once
+	I64		 last_run;		//jiffy of last execution
+	I64		 goal_id;		//linked goal, 0=none
+	U0		 (*action)(U8 *data);
+	U8		*data;
+	I64		 run_count;
+	I64		 fail_count;
+};
+
+public class CAgentMeta
+{
+	U8		 name[AGENT_NAME_LEN];
+	I64		 agent_id;
+	I64		 agent_flags;
+	I64		 role;			//AGENT_ROLE_*
+	I64		 effort_cap;	//max effort per task
+	I64		 hourly_budget;
+	I64		 daily_budget;
+	I64		 hourly_used;
+	I64		 daily_used;
+	F64		 pain;			//0.0-1.0, drives priority
+	F64		 cooldown;		//jiffies until next eligible tick
+	I64		 spawn_depth;	//ForgeDispatch nesting depth
+	CTask	*task;			//owning CTask
+	CAgentTask tasks[AGENT_MAX_TASKS];
+	I64		 task_count;
+	U8		 skills[AGENT_MAX_SKILLS][AGENT_NAME_LEN];
+	I64		 skill_count;
+	I64		 last_tick;		//jiffy of last AgentTick
+};
+
+//--- Slot Pool (resource semaphores) ---
+
+#define SLOT_TYPE_GPU	0
+#define SLOT_TYPE_CPU	1
+#define SLOT_TYPE_IO	2
+#define SLOT_TYPES_NUM	3
+
+public class CSlotPool
+{
+	I64		 total[SLOT_TYPES_NUM];
+	I64		 used[SLOT_TYPES_NUM];
+	I64		 waiters[SLOT_TYPES_NUM]; //count of waiting tasks
+};
+
+//--- Kernel AI State ---
+
+public class CKernelState
+{
+	CAgentMeta	*agents[AGENT_MAX_AGENTS];
+	I64			 agent_count;
+	I64			 running_count;
+	F64			 system_pain;	//0.0-1.0 aggregate
+	F64			 system_load;	//0.0-1.0
+	CSlotPool	 slots;
+	I64			 total_ticks;
+	I64			 total_dispatches;
+};
+
+#help_index "AI/FluxIDT"
+
+//--- FluxIDT: Interrupt-Driven Event Bus (absorbs FluxEmitter) ---
+
+#define FLUX_RING_CAPACITY		256		//events per ring
+#define FLUX_MAX_VECTORS		32		//0x60-0x7F
+#define FLUX_PAYLOAD_SIZE		480		//bytes inline
+#define FLUX_MAX_HANDLERS		8		//per vector
+
+//FluxIDT vector assignments (INT 0x60-0x7F)
+#define I_FLUX_BASE				0x60
+#define I_FLUX_SVC_HEALTH		0x60
+#define I_FLUX_LLM_EVENT		0x61
+#define I_FLUX_AGENT_EVENT		0x62
+#define I_FLUX_GOAL_EVENT		0x63
+#define I_FLUX_MEMORY_EVENT		0x64
+#define I_FLUX_TOOL_EVENT		0x65
+#define I_FLUX_PAIN_PLEASURE	0x66
+#define I_FLUX_AFFECT			0x67
+#define I_FLUX_SECURITY			0x68
+#define I_FLUX_CONTEXT			0x69
+//0x6A-0x6F reserved
+//0x70-0x7F user-allocated
+
+//Event types within each vector
+#define FLUX_EVT_INFO			0
+#define FLUX_EVT_WARNING		1
+#define FLUX_EVT_ERROR			2
+#define FLUX_EVT_CRITICAL		3
+#define FLUX_EVT_STATE_CHANGE	4
+#define FLUX_EVT_REQUEST		5
+#define FLUX_EVT_RESPONSE		6
+#define FLUX_EVT_HEARTBEAT		7
+
+public class CFluxEvent
+{
+	I64		 timestamp;		//TSC value
+	I64		 event_type;	//FLUX_EVT_*
+	I64		 source_agent;	//agent_id or 0 for system
+	I64		 payload_len;
+	U8		 payload[FLUX_PAYLOAD_SIZE];
+};
+
+public class CFluxRing
+{
+	I64			 head;		//write position (producer)
+	I64			 tail;		//read position (consumer)
+	I64			 capacity;
+	I64			 drop_count;	//overflows
+	I64			 total_events;
+	CFluxEvent	 events[FLUX_RING_CAPACITY];
+};
+
+public class CFluxHandler
+{
+	U0		 (*handler)(CFluxEvent *event);
+	I64		 agent_id;		//0=all agents
+};
+
+public class CFluxVector
+{
+	CFluxRing		 ring;
+	CFluxHandler	 handlers[FLUX_MAX_HANDLERS];
+	I64				 handler_count;
+};
+
+public class CFluxContextState
+{
+	I64		 uptime_jiffies;
+	F64		 cpu_load;
+	F64		 gpu_util;		//0 in Phase 0
+	I64		 active_agents;
+	F64		 pain;			//system-wide pain 0.0-1.0
+	F64		 valence;		//-1.0 to 1.0 (negative=bad)
+	F64		 arousal;		//0.0-1.0 (excitement level)
+	I64		 last_update;	//TSC
+};
+
+#help_index "AI/Capability"
+
+//--- Capability Engine (absorbs AitherOS CapabilityEngine) ---
+
+#define CAP_MAX_CAPABILITIES	16
+#define CAP_PATTERN_LEN			64	//dot-delimited resource pattern
+#define CAP_MAX_AUDIT_LOG		256
+#define CAP_HMAC_KEY_LEN		32
+#define CAP_HMAC_SIG_LEN		32
+
+//Action mask bits
+#define CAPa_READ				0x01
+#define CAPa_WRITE				0x02
+#define CAPa_EXECUTE			0x04
+#define CAPa_SPAWN				0x08
+#define CAPa_DELEGATE			0x10
+#define CAPa_ADMIN				0x20
+
+public class CCapability
+{
+	U8		 resource[CAP_PATTERN_LEN];	//e.g. "agent.*" or "tool.shell.exec"
+	I64		 action_mask;				//CAPa_* bits
+	I64		 constraints;				//reserved for future use
+};
+
+public class CCapToken
+{
+	I64			 agent_id;
+	CCapability	 caps[CAP_MAX_CAPABILITIES];
+	I64			 cap_count;
+	I64			 llm_tier_max;	//max LLM effort level allowed
+	I64			 expiry;		//jiffy when token expires, 0=never
+	U8			 signature[CAP_HMAC_SIG_LEN]; //HMAC-SHA256
+};
+
+#define CAP_AUDIT_ALLOW		0
+#define CAP_AUDIT_DENY		1
+
+public class CCapAudit
+{
+	I64		 timestamp;
+	I64		 agent_id;
+	U8		 resource[CAP_PATTERN_LEN];
+	I64		 action;
+	I64		 result;	//CAP_AUDIT_ALLOW or CAP_AUDIT_DENY
+};
+
+public class CCapEngine
+{
+	CCapToken	*tokens[AGENT_MAX_AGENTS]; //indexed by agent_id
+	CCapAudit	 audit_log[CAP_MAX_AUDIT_LOG];
+	I64			 audit_head;
+	I64			 audit_count;
+	U8			 hmac_key[CAP_HMAC_KEY_LEN];
+};
+
+#help_index "AI/Identity"
+
+//--- Identity System + AgentForge (absorbs IdentitySystem, AgentForge) ---
+
+#define IDENTITY_MAX			64
+#define FORGE_MAX_DEPTH			3	//max spawn nesting
+#define FORGE_MAX_SESSIONS		32
+
+#define FORGE_STATUS_PENDING	0
+#define FORGE_STATUS_RUNNING	1
+#define FORGE_STATUS_COMPLETE	2
+#define FORGE_STATUS_FAILED		3
+#define FORGE_STATUS_TIMEOUT	4
+
+public class CIdentity
+{
+	U8		 name[AGENT_NAME_LEN];
+	I64		 role;				//AGENT_ROLE_*
+	I64		 effort_cap;
+	I64		 hourly_budget;
+	I64		 daily_budget;
+	I64		 flags;				//AGENTf_* defaults
+	U8		 skills[AGENT_MAX_SKILLS][AGENT_NAME_LEN];
+	I64		 skill_count;
+	U8		 tool_profile[AGENT_NAME_LEN]; //e.g. "full", "minimal", "readonly"
+};
+
+public class CForgeSpec
+{
+	U8		 agent_type[AGENT_NAME_LEN];	//identity name to spawn
+	U8		 task_desc[256];				//task description
+	I64		 max_turns;
+	I64		 max_seconds;
+	I64		 effort;						//1-10
+	Bool	 isolate;						//Ring-3 sandbox?
+};
+
+public class CForgeSession
+{
+	I64		 id;
+	I64		 status;		//FORGE_STATUS_*
+	I64		 depth;			//spawn nesting depth
+	CTask	*task;
+	I64		 start_jiffy;
+	I64		 end_jiffy;
+	I64		 parent_agent;	//agent_id of parent
+	U8		 result[256];
+};
+
+#help_index "AI/Inference"
+
+//--- Inference Queue + Model Registry (Phase 1+) ---
+//Backend-agnostic priority queue for LLM inference.
+//Dispatches to: LOCAL_CPU (llama.cpp), LOCAL_GPU (Xe compute),
+//EXTERN_HTTP (vLLM/Claude/Ollama over network).
+
+#define INFER_QUEUE_CAPACITY	64
+#define INFER_MODEL_MAX			16
+#define INFER_MODEL_NAME_LEN	48
+#define INFER_PROMPT_INLINE		4096	//inline prompt buffer
+#define INFER_OUTPUT_INLINE		4096	//inline output buffer
+#define INFER_ENDPOINT_LEN		128		//URL for EXTERN_HTTP
+
+//Inference backends
+#define INFER_BACKEND_NONE		0	//not available
+#define INFER_BACKEND_LOCAL_CPU	1	//llama.cpp on host CPU (Phase 2)
+#define INFER_BACKEND_LOCAL_GPU	2	//Xe/AMDGPU compute kernel (Phase 3)
+#define INFER_BACKEND_EXTERN	3	//HTTP POST to remote vLLM/API (Phase 1)
+#define INFER_BACKEND_ACCEL		4	//NPU/TPU via MMIO (future)
+
+//Request status
+#define INFER_STATUS_FREE		0
+#define INFER_STATUS_QUEUED		1
+#define INFER_STATUS_RUNNING	2
+#define INFER_STATUS_COMPLETE	3
+#define INFER_STATUS_FAILED		4
+#define INFER_STATUS_DEDUPED	5	//merged with identical pending request
+
+//Request flags
+#define INFERf_STREAM			0	//streaming response
+#define INFERf_JSON_MODE		1	//force JSON output
+#define INFERf_SYSTEM_PRIORITY	2	//kernel-priority, skip queue
+
+public class CInferReq
+{
+	I64		 id;
+	I64		 priority;			//0-10, higher = more urgent
+	I64		 agent_id;			//requesting agent
+	U8		 model[INFER_MODEL_NAME_LEN]; //"auto" for automatic selection
+	U8		 prompt[INFER_PROMPT_INLINE];
+	I64		 prompt_len;
+	I64		 max_tokens;		//max output tokens
+	I64		 temperature_x100;	//temperature * 100 (70 = 0.7) ΓÇö no FPU in structs
+	I64		 dedup_hash;		//hash of prompt for deduplication
+	I64		 status;			//INFER_STATUS_*
+	I64		 flags;				//INFERf_* bits
+	I64		 submit_tsc;		//TSC at submission
+	I64		 start_tsc;			//TSC when dispatch began
+	I64		 complete_tsc;		//TSC when response arrived
+	U0		 (*callback)(CInferReq *req); //async completion callback, NULL=sync
+};
+
+public class CInferResp
+{
+	I64		 req_id;			//matching request ID
+	U8		 output[INFER_OUTPUT_INLINE];
+	I64		 output_len;
+	I64		 tokens_used;		//actual tokens generated
+	I64		 latency_tsc;		//TSC cycles taken
+	U8		 model_used[INFER_MODEL_NAME_LEN]; //which model actually served it
+	I64		 backend_used;		//INFER_BACKEND_*
+};
+
+public class CModelEntry
+{
+	U8		 name[INFER_MODEL_NAME_LEN];	//e.g. "llama-3.2-7b-q4"
+	I64		 backend;			//INFER_BACKEND_*
+	I64		 vram_mb;			//VRAM required (0 for CPU, >0 for GPU)
+	I64		 ctx_len;			//max context length in tokens
+	F64		 speed;				//tokens/sec estimate
+	I64		 quality;			//quality score 0-10
+	U8		 endpoint[INFER_ENDPOINT_LEN]; //for EXTERN_HTTP: "http://host:port/path"
+	Bool	 loaded;			//currently loaded in memory/GPU?
+	Bool	 available;			//backend operational?
+	I64		 total_requests;	//lifetime stats
+	I64		 total_tokens;
+	I64		 total_errors;
+};
+
+public class CInferQueueStats
+{
+	I64		 total_submitted;
+	I64		 total_completed;
+	I64		 total_failed;
+	I64		 total_deduped;
+	I64		 avg_latency_tsc;	//running average
+	I64		 peak_depth;		//max queue depth seen
+};
+
+public class CInferQueue
+{
+	CInferReq	 requests[INFER_QUEUE_CAPACITY];
+	I64			 count;			//current queue depth
+	I64			 next_id;		//monotonic request ID
+
+	CModelEntry	 models[INFER_MODEL_MAX];
+	I64			 model_count;
+	U8			 default_model[INFER_MODEL_NAME_LEN];
+
+	CInferQueueStats stats;
+
+	//Per-agent rate limiting (requests per minute)
+	I64			 agent_rpm[AGENT_MAX_AGENTS];
+	I64			 agent_rpm_limit;	//default: 60
+	I64			 agent_last_reset;	//jiffy of last RPM counter reset
+};
+
+#help_index "AI/ReactLoop"
+
+//--- ReAct Loop + Context Pipeline (Phase 2 stubs) ---
+
+#define REACT_PHASE_OBSERVE		0
+#define REACT_PHASE_THINK		1
+#define REACT_PHASE_ACT			2
+#define REACT_PHASE_DONE		3
+
+#define REACT_MAX_CONTEXT_PAGES	32
+#define REACT_CONTEXT_PAGE_SIZE	1024
+
+#define REACTf_CANCELLED		0
+#define REACTf_TIMEOUT			1
+#define REACTf_BUDGET_EXCEEDED	2
+
+public class CContextPage
+{
+	U8		 tag[32];			//e.g. "[IDENTITY]", "[MEMORY]", "[TOOLS]"
+	U8		 content[REACT_CONTEXT_PAGE_SIZE];
+	I64		 content_len;
+	I64		 priority;			//higher = included first when budget-trimming
+};
+
+public class CReActState
+{
+	I64		 phase;				//REACT_PHASE_*
+	I64		 turn;				//current turn number
+	I64		 max_turns;			//budget limit
+	I64		 max_tokens;		//token budget
+	I64		 max_tool_calls;	//tool call budget
+	I64		 tokens_used;		//running total
+	I64		 tool_calls_used;	//running total
+	I64		 flags;				//REACTf_* bits
+	I64		 timeout_tsc;		//TSC deadline (0 = no timeout)
+	I64		 agent_id;			//owning agent
+
+	CContextPage context[REACT_MAX_CONTEXT_PAGES];
+	I64		 context_count;
+};
+
+#help_index "AI/Conversation"
+
+//--- Conversation Store (Phase 2 stub) ---
+
+#define CONV_MAX_MESSAGES		256
+#define CONV_MESSAGE_INLINE		512
+#define CONV_MAX_ACTIVE			32
+
+#define CONV_ROLE_SYSTEM		0
+#define CONV_ROLE_USER			1
+#define CONV_ROLE_ASSISTANT		2
+#define CONV_ROLE_TOOL			3
+
+public class CConvMessage
+{
+	I64		 role;				//CONV_ROLE_*
+	U8		 content[CONV_MESSAGE_INLINE];
+	I64		 content_len;
+	I64		 timestamp;			//TSC
+	I64		 token_count;		//estimated tokens
+};
+
+public class CConversation
+{
+	I64			 id;
+	I64			 agent_id;
+	CConvMessage messages[CONV_MAX_MESSAGES];
+	I64			 message_count;
+	I64			 total_tokens;
+	I64			 created_tsc;
+	I64			 last_active_tsc;
+};
+
+#help_index "AI/GPU"
+
+//--- GPU Compute Abstraction (Phase 3 stubs) ---
+//Backend-agnostic GPU interface. Phase 3 implements for Intel Xe,
+//AMD AMDGPU, or network offload.
+
+#define GPU_BACKEND_NONE		0
+#define GPU_BACKEND_XE			1	//Intel Arc / Xe
+#define GPU_BACKEND_AMDGPU		2	//AMD RDNA/CDNA
+#define GPU_BACKEND_NETWORK		3	//GPU over network (vLLM)
+#define GPU_BACKEND_NPU			4	//Intel NPU / Qualcomm Hexagon
+
+#define GPU_MAX_DEVICES			4
+#define GPU_NAME_LEN			64
+
+public class CGPUDevice
+{
+	U8		 name[GPU_NAME_LEN];		//e.g. "Intel Arc A770"
+	I64		 backend;					//GPU_BACKEND_*
+	I64		 vram_total_mb;
+	I64		 vram_used_mb;
+	I64		 compute_units;				//EUs (Intel), CUs (AMD)
+	I64		 clock_mhz;
+	U8		*bar0;						//PCIe BAR0 MMIO mapping
+	I64		 bar0_size;
+	I64		 pci_bus, pci_dev, pci_func;
+	Bool	 initialized;
+};
+
+public class CGPUState
+{
+	CGPUDevice	 devices[GPU_MAX_DEVICES];
+	I64			 device_count;
+	I64			 active_device;			//currently selected device
+	I64			 total_dispatches;
+	I64			 total_compute_tsc;		//total TSC spent in GPU dispatch
+};
+
+#help_index "AI/Syscall"
+
+//--- Syscall Gate (Ring-3 -> Ring-0) ---
+
+#define I_SYSCALL			0x80
+
+#define SYS_FLUX_EMIT		0x01
+#define SYS_INFER_SUBMIT	0x02
+#define SYS_TOOL_INVOKE		0x03
+#define SYS_MEM_ALLOC		0x04
+#define SYS_MEM_FREE		0x05
+#define SYS_HASH_GET		0x06
+#define SYS_HASH_PUT		0x07
+#define SYS_CAP_CHECK		0x08
+#define SYS_GOAL_UPDATE		0x09
+#define SYS_CONV_APPEND		0x0A
+#define SYS_CONTEXT_ASSEMBLE 0x0B
+#define SYS_AGENT_YIELD		0x0C
+#define SYSCALL_MAX			0x0C
+
+//--- Sandbox (Ring-3 isolation) ---
+
+public class CAgentSandbox
+{
+	I64			 agent_id;
+	I64			*pml4;			//separate page tables
+	U8			*code_base;		//code region start
+	I64			 code_size;
+	U8			*data_base;		//data region start
+	I64			 data_size;
+	U8			*stack_base;	//stack region start
+	I64			 stack_size;
+	CCapToken	*cap_token;
+};
+
+//--- Extended Run Levels ---
+
+#define RLf_AI_MODELS			21
+#define RLf_AGENT_KERNEL		22
+#define RLf_NETWORK				23
+#define RLf_AI_SYSTEM_READY		24
+
+#define RLF_AI_MODELS			(1 << RLf_AI_MODELS)
+#define RLF_AGENT_KERNEL		(1 << RLf_AGENT_KERNEL)
+#define RLF_NETWORK				(1 << RLf_NETWORK)
+#define RLF_AI_SYSTEM_READY		(1 << RLf_AI_SYSTEM_READY)
+
+//--- Extended Hash Types for AI ---
+
+#define HTt_CAP_TOKEN			21
+#define HTt_IDENTITY			22
+#define HTt_SERVICE				23
+#define HTt_AGENT				24
+
+#define HTT_CAP_TOKEN			0x200000
+#define HTT_IDENTITY			0x400000
+#define HTT_SERVICE				0x800000
+#define HTT_AGENT				0x1000000
+
+//--- Extended Task Flags for AI ---
+
+#define TASKf_AI_AGENT			16	//task is an AI agent
+#define TASKf_AI_SANDBOXED		17	//task runs in Ring-3 sandbox
+#define TASKf_AI_FORGE_CHILD	18	//task was spawned by ForgeDispatch
+
+//--- Agent Scoring Weights ---
+
+#define AGENT_W_STALENESS		0x3FF0000000000000(F64)	//1.0
+#define AGENT_W_PAIN			0x4000000000000000(F64)	//2.0
+#define AGENT_W_GOAL			0x3FF8000000000000(F64)	//1.5
+#define AGENT_W_EFFORT_COST		0x3FE0000000000000(F64)	//0.5
 
 #help_index ""

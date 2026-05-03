@@ -250,5 +250,12 @@ He had no idea why he got a IRQ 0x27.
 	IntEntrySet(I_MP_CRASH, *INT_MP_CRASH_ADDR(U32 *));
 	IntEntrySet(I_WAKE,		 INT_WAKE);
 	IntEntrySet(I_DEBUG,	&debug.int_fault_code[7 * I_DEBUG]);
+
+	//ZealOS-AI: Reserve FluxIDT vectors 0x60-0x7F for event bus.
+	//These are initially set to IntNop (safe default).
+	//FluxInit() and SyscallInit() will wire them up later in boot.
+	for (i = I_FLUX_BASE; i < I_FLUX_BASE + FLUX_MAX_VECTORS; i++)
+		IntEntrySet(i, &IntNop);
+
 	POPFD
 }

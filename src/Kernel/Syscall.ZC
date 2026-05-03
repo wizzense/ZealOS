@@ -1,0 +1,140 @@
+/*ZealOS-AI: Syscall ΓÇö INT 0x80 Gate for Ring-3 Sandboxes
+Provides a syscall interface for sandboxed agents running in
+Ring-3 to access kernel AI services (FluxEmit, CapCheck, etc.)
+
+In Phase 0, all agents run Ring-0 and call functions directly.
+This module provides the infrastructure for Ring-3 isolation
+when CAgentSandbox is used (opt-in per agent).
+
+Syscall convention:
+  RAX = syscall number (SYS_FLUX_EMIT, etc.)
+  RDI = arg1
+  RSI = arg2
+  RDX = arg3
+  RCX = arg4
+  R8  = arg5
+  Returns result in RAX.
+*/
+
+I64 SyscallDispatch(I64 num, I64 arg1, I64 arg2, I64 arg3, I64 arg4, I64 arg5)
+{//Dispatch a syscall from Ring-3 to kernel function.
+//Called from INT 0x80 handler with args extracted from registers.
+	switch (num)
+	{
+		case SYS_FLUX_EMIT:
+			return FluxEmit(arg1, arg2, arg3, arg4, arg5);
+
+		case SYS_CAP_CHECK:
+			return CapCheck(arg1, arg2, arg3);
+
+		case SYS_AGENT_YIELD:
+			Yield;
+			return 0;
+
+		case SYS_HASH_GET:
+			//arg1=str, arg2=table ptr, arg3=type mask
+			return HashFind(arg1, arg2, arg3);
+
+		case SYS_HASH_PUT:
+			//arg1=entry, arg2=table ptr
+			HashAdd(arg1, arg2);
+			return 0;
+
+		case SYS_MEM_ALLOC:
+			return MAlloc(arg1);
+
+		case SYS_MEM_FREE:
+			Free(arg1);
+			return 0;
+
+		case SYS_GOAL_UPDATE:
+		case SYS_CONV_APPEND:
+		case SYS_CONTEXT_ASSEMBLE:
+		case SYS_INFER_SUBMIT:
+		case SYS_TOOL_INVOKE:
+			//Phase 2+ stubs ΓÇö return -1 (not implemented)
+			return -1;
+
+		default:
+			return -1;
+	}
+}
+
+asm {
+//INT 0x80 handler ΓÇö extracts args from registers and calls SyscallDispatch
+_SYSCALL_HANDLER::
+	PUSH	RBP
+	MOV		RBP, RSP
+	PUSH	RBX
+
+	//Save syscall args
+	PUSH	R8		//arg5
+	PUSH	RCX		//arg4
+	PUSH	RDX		//arg3
+	PUSH	RSI		//arg2
+	PUSH	RDI		//arg1
+	PUSH	RAX		//syscall num
+
+	CALL	&SyscallDispatch
+
+	//Result is in RAX
+	ADD		RSP, 48	//pop 6 args
+	POP		RBX
+	POP		RBP
+	IRET
+}
+
+_extern _SYSCALL_HANDLER U0 SyscallHandler();
+
+U0 SyscallInit()
+{//Register INT 0x80 as the syscall gate.
+	IntEntrySet(I_SYSCALL, &SyscallHandler, IDTET_IRQ);
+	"SyscallInit: INT 0x80 registered\n";
+}
+
+//--- Sandbox Creation (Phase 0 stub, full Ring-3 in Phase 1+) ---
+
+CAgentSandbox *SandboxCreate(I64 agent_id, CCapToken *cap_token)
+{//Create a sandbox for an agent. Phase 0: stub that marks agent sandboxed.
+//Full Ring-3 page table isolation requires Phase 1 page table work.
+	CAgentSandbox *sandbox;
+
+	sandbox = CAlloc(sizeof(CAgentSandbox));
+	sandbox->agent_id = agent_id;
+	sandbox->cap_token = cap_token;
+
+	//Phase 0: no separate page tables ΓÇö just mark the flag
+	sandbox->pml4 = NULL;
+	sandbox->code_base = NULL;
+	sandbox->code_size = 0;
+	sandbox->data_base = NULL;
+	sandbox->data_size = 0;
+	sandbox->stack_base = NULL;
+	sandbox->stack_size = 0;
+
+	//Mark agent as sandboxed
+	if (agent_id >= 0 && agent_id < AGENT_MAX_AGENTS &&
+		kernel_state.agents[agent_id])
+	{
+		LBts(&kernel_state.agents[agent_id]->agent_flags, AGENTf_SANDBOXED);
+	}
+
+	FluxEmit(I_FLUX_SECURITY, FLUX_EVT_INFO, agent_id,
+			 "SANDBOX_CREATED", 15);
+
+	return sandbox;
+}
+
+U0 SandboxDestroy(CAgentSandbox *sandbox)
+{//Destroy a sandbox and free resources.
+	if (!sandbox) return;
+
+	if (sandbox->agent_id >= 0 && sandbox->agent_id < AGENT_MAX_AGENTS &&
+		kernel_state.agents[sandbox->agent_id])
+	{
+		LBtr(&kernel_state.agents[sandbox->agent_id]->agent_flags, AGENTf_SANDBOXED);
+	}
+
+	//Phase 1+: free separate page tables here
+	Free(sandbox);
+}

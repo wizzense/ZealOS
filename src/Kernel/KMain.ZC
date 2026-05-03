@@ -78,15 +78,15 @@ U0 SysGrInit()
 
 	//patch some chars
 	text.aux_font[10]	= text.font[10]; //"Return" symbol 
-	text.aux_font[255]	= text.font[255]; //Block symbol  
+	text.aux_font[255]	= text.font[255]; //Block symbol ∩┐╜
 
-	for (i = '│'; i < '█'; i++)
+	for (i = '∩┐╜'; i < '∩┐╜'; i++)
 		text.aux_font[i] = text.font[i];
 
-	text.aux_font['⌐'] = text.font['⌐'];
+	text.aux_font['∩┐╜'] = text.font['∩┐╜'];
 	
-	text.border_chars[2] (I64) = '─═│║┌╔┐╗';
-	text.border_chars[10](U32) = '└╚┘╝';
+	text.border_chars[2] (I64) = '∩┐╜═│∩┐╜∩┐╜╔┐∩┐╜';
+	text.border_chars[10](U32) = '∩┐╜∩┐╜┘╝';
 
 	text.cols = sys_framebuffer_width  / FONT_WIDTH;
 	text.rows = sys_framebuffer_height / FONT_HEIGHT;
@@ -238,6 +238,53 @@ U0 KMain()
 	}
 
 	LBts(&sys_run_level, RLf_SYSTEM_SERVER);
+
+	//=================================================================
+	// ZealOS-AI: Initialize AI Kernel Subsystems
+	//=================================================================
+
+	"AIInit: FluxIDT;\n";
+	FluxInit;
+
+	"AIInit: CapEngine;\n";
+	CapEngineInit;
+
+	"AIInit: Syscall;\n";
+	SyscallInit;
+
+	"AIInit: Identities;\n";
+	IdentityInit;
+	IdentitiesLoadDefaults;
+
+	"AIInit: InferQueue;\n";
+	InferQueueInit;
+	GPUInit;
+
+	//Scan for GPUs (Phase 3: will populate gpu_state)
+	I64 n_gpus = GPUDetect;
+	if (n_gpus > 0)
+		"AIInit: %d GPU(s) detected\n", n_gpus;
+	else
+		"AIInit: No GPU ΓÇö network offload or CPU inference\n";
+
+	//Initialize kernel state
+	MemSet(&kernel_state, 0, sizeof(CKernelState));
+	SlotPoolInit(n_gpus, mp_count, 4); //GPU slots=detected, CPU=cores, 4 IO slots
+	LBts(&sys_run_level, RLf_AI_MODELS);
+
+	//Spawn default agents from identities
+	"AIInit: Spawning agents;\n";
+	AgentSpawn("orchestrator");
+	AgentSpawn("worker");
+	AgentSpawn("monitor");
+	LBts(&sys_run_level, RLf_AGENT_KERNEL);
+
+	//Signal system ready via FluxIDT
+	FluxEmit(I_FLUX_SVC_HEALTH, FLUX_EVT_STATE_CHANGE, 0,
+			 "SYSTEM_READY", 12);
+	LBts(&sys_run_level, RLf_AI_SYSTEM_READY);
+	"ZealOS-AI: SYSTEM_READY (%d agents)\n", kernel_state.agent_count;
+
 	ServerTaskCont; //Never to return
 }
 

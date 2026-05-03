@@ -1,0 +1,496 @@
+/*ZealOS-AI: InferQueue ΓÇö Unified Inference Priority Queue
+Absorbs AitherOS LLMQueue + ModelRegistry into a kernel-native
+priority queue with backend routing.
+
+ALL inference requests go through this queue regardless of backend:
+  - EXTERN_HTTP: POST to remote vLLM/Claude/Ollama (Phase 1)
+  - LOCAL_CPU:   llama.cpp on host CPU (Phase 2)
+  - LOCAL_GPU:   Xe/AMDGPU compute kernel (Phase 3)
+
+The queue provides:
+  - Priority ordering (effort-based, kernel-priority bypass)
+  - Request deduplication (same prompt ΓåÆ share result)
+  - Per-agent rate limiting (RPM budgets)
+  - Backend routing (modelΓåÆbackend, auto-selection)
+  - Latency tracking and stats
+
+Equivalent to AitherOS MicroScheduler:8150 but at syscall speed.
+*/
+
+CInferQueue infer_queue;
+
+U0 InferQueueInit()
+{//Initialize the inference queue to empty state.
+	I64 i;
+
+	MemSet(&infer_queue, 0, sizeof(CInferQueue));
+	infer_queue.next_id = 1;
+	infer_queue.agent_rpm_limit = 60;
+	infer_queue.agent_last_reset = counts.jiffies;
+
+	for (i = 0; i < INFER_QUEUE_CAPACITY; i++)
+		infer_queue.requests[i].status = INFER_STATUS_FREE;
+
+	StrCopy(infer_queue.default_model, "auto");
+}
+
+//--- Model Registry ---
+
+I64 ModelRegister(U8 *name, I64 backend, I64 vram_mb, I64 ctx_len,
+				  F64 speed, I64 quality, U8 *endpoint=NULL)
+{//Register a model in the registry. Returns model index or -1.
+	CModelEntry *m;
+
+	if (infer_queue.model_count >= INFER_MODEL_MAX)
+		return -1;
+	if (!name || !*name)
+		return -1;
+
+	m = &infer_queue.models[infer_queue.model_count];
+	MemCopy(m->name, name, MinI64(StrLen(name) + 1, INFER_MODEL_NAME_LEN));
+	m->backend = backend;
+	m->vram_mb = vram_mb;
+	m->ctx_len = ctx_len;
+	m->speed = speed;
+	m->quality = quality;
+	m->loaded = FALSE;
+	m->available = (backend == INFER_BACKEND_EXTERN); //extern is always "available"
+	m->total_requests = 0;
+	m->total_tokens = 0;
+	m->total_errors = 0;
+
+	if (endpoint)
+		MemCopy(m->endpoint, endpoint, MinI64(StrLen(endpoint) + 1, INFER_ENDPOINT_LEN));
+	else
+		m->endpoint[0] = 0;
+
+	return infer_queue.model_count++;
+}
+
+CModelEntry *ModelFind(U8 *name)
+{//Find a model by name. Returns NULL if not found.
+	I64 i;
+
+	for (i = 0; i < infer_queue.model_count; i++)
+	{
+		if (!StrCompare(infer_queue.models[i].name, name))
+			return &infer_queue.models[i];
+	}
+	return NULL;
+}
+
+CModelEntry *ModelAutoSelect(I64 effort, I64 agent_id)
+{//Auto-select best model based on effort level and availability.
+//Mirrors AitherOS EffortScaler: low effort ΓåÆ small/fast, high ΓåÆ quality.
+	I64			 i, best_idx;
+	F64			 best_score, score;
+	CModelEntry	*m;
+	CCapToken	*token;
+
+	best_idx = -1;
+	best_score = -1.0;
+
+	//Check agent's LLM tier cap from capability token
+	token = cap_engine.tokens[agent_id];
+	if (token && effort > token->llm_tier_max)
+		effort = token->llm_tier_max;
+
+	for (i = 0; i < infer_queue.model_count; i++)
+	{
+		m = &infer_queue.models[i];
+		if (!m->available) continue;
+
+		//Score: balance quality against speed based on effort
+		//High effort ΓåÆ weight quality. Low effort ΓåÆ weight speed.
+		if (effort >= 7)
+			score = ToF64(m->quality) * 2.0 + m->speed * 0.5;
+		else if (effort >= 3)
+			score = ToF64(m->quality) * 1.0 + m->speed * 1.0;
+		else
+			score = ToF64(m->quality) * 0.5 + m->speed * 2.0;
+
+		//Penalize GPU models if no GPU available
+		if (m->backend == INFER_BACKEND_LOCAL_GPU && m->vram_mb > 0)
+			score *= 0.1; //Phase 0/1: basically skip GPU models
+
+		if (score > best_score)
+		{
+			best_score = score;
+			best_idx = i;
+		}
+	}
+
+	if (best_idx >= 0)
+		return &infer_queue.models[best_idx];
+	return NULL;
+}
+
+//--- Request Submission ---
+
+I64 InferHashPrompt(U8 *prompt, I64 len)
+{//Simple hash for dedup. Uses ZealOS HashStr on first 256 chars.
+	U8 buf[257];
+	I64 copy_len;
+
+	copy_len = MinI64(len, 256);
+	MemCopy(buf, prompt, copy_len);
+	buf[copy_len] = 0;
+	return HashStr(buf);
+}
+
+I64 InferFindDedup(I64 dedup_hash)
+{//Find an existing queued/running request with same hash.
+//Returns request index or -1.
+	I64 i;
+
+	if (!dedup_hash) return -1;
+
+	for (i = 0; i < INFER_QUEUE_CAPACITY; i++)
+	{
+		if ((infer_queue.requests[i].status == INFER_STATUS_QUEUED ||
+			 infer_queue.requests[i].status == INFER_STATUS_RUNNING) &&
+			infer_queue.requests[i].dedup_hash == dedup_hash)
+			return i;
+	}
+	return -1;
+}
+
+I64 InferFindFreeSlot()
+{//Find a free request slot. Returns index or -1.
+	I64 i;
+
+	for (i = 0; i < INFER_QUEUE_CAPACITY; i++)
+	{
+		if (infer_queue.requests[i].status == INFER_STATUS_FREE ||
+			infer_queue.requests[i].status == INFER_STATUS_COMPLETE ||
+			infer_queue.requests[i].status == INFER_STATUS_FAILED ||
+			infer_queue.requests[i].status == INFER_STATUS_DEDUPED)
+			return i;
+	}
+	return -1;
+}
+
+CInferReq *InferSubmit(I64 agent_id, U8 *prompt, I64 prompt_len,
+					   U8 *model_name=NULL, I64 priority=5,
+					   I64 max_tokens=512, I64 temperature_x100=70,
+					   U0 (*callback)(CInferReq *req)=NULL)
+{//Submit an inference request to the queue.
+//Returns request pointer, or NULL if queue full / rate limited.
+	CInferReq	*req;
+	I64			 slot, dedup_idx, dedup_hash;
+
+	//Capability check
+	if (!CapCheck(agent_id, "infer.*", CAPa_EXECUTE))
+	{
+		FluxEmit(I_FLUX_SECURITY, FLUX_EVT_WARNING, agent_id,
+				 "INFER_DENIED", 12);
+		return NULL;
+	}
+
+	//Rate limit check (reset counters every ~60s)
+	if (counts.jiffies - infer_queue.agent_last_reset > 60 * 18) //~18.2 Hz PIT
+	{
+		MemSet(infer_queue.agent_rpm, 0, sizeof(I64) * AGENT_MAX_AGENTS);
+		infer_queue.agent_last_reset = counts.jiffies;
+	}
+
+	if (agent_id >= 0 && agent_id < AGENT_MAX_AGENTS)
+	{
+		if (infer_queue.agent_rpm[agent_id] >= infer_queue.agent_rpm_limit)
+		{
+			FluxEmit(I_FLUX_LLM_EVENT, FLUX_EVT_WARNING, agent_id,
+					 "RATE_LIMITED", 12);
+			return NULL;
+		}
+		infer_queue.agent_rpm[agent_id]++;
+	}
+
+	//Dedup check
+	dedup_hash = InferHashPrompt(prompt, prompt_len);
+	dedup_idx = InferFindDedup(dedup_hash);
+	if (dedup_idx >= 0)
+	{
+		infer_queue.stats.total_deduped++;
+		//Return the existing request (caller can poll or attach callback)
+		return &infer_queue.requests[dedup_idx];
+	}
+
+	//Find free slot
+	PUSHFD
+	CLI
+	slot = InferFindFreeSlot();
+	if (slot < 0)
+	{
+		POPFD
+		infer_queue.stats.total_failed++;
+		return NULL; //queue full
+	}
+
+	req = &infer_queue.requests[slot];
+	req->id = infer_queue.next_id++;
+	req->priority = priority;
+	req->agent_id = agent_id;
+	req->max_tokens = max_tokens;
+	req->temperature_x100 = temperature_x100;
+	req->dedup_hash = dedup_hash;
+	req->status = INFER_STATUS_QUEUED;
+	req->flags = 0;
+	req->submit_tsc = TSCGet;
+	req->start_tsc = 0;
+	req->complete_tsc = 0;
+	req->callback = callback;
+
+	//Copy model name
+	if (model_name && *model_name)
+		MemCopy(req->model, model_name, MinI64(StrLen(model_name) + 1, INFER_MODEL_NAME_LEN));
+	else
+		StrCopy(req->model, "auto");
+
+	//Copy prompt (truncate if too long)
+	if (prompt_len > INFER_PROMPT_INLINE)
+		prompt_len = INFER_PROMPT_INLINE;
+	MemCopy(req->prompt, prompt, prompt_len);
+	req->prompt_len = prompt_len;
+
+	infer_queue.count++;
+	infer_queue.stats.total_submitted++;
+	if (infer_queue.count > infer_queue.stats.peak_depth)
+		infer_queue.stats.peak_depth = infer_queue.count;
+
+	POPFD
+
+	FluxEmit(I_FLUX_LLM_EVENT, FLUX_EVT_REQUEST, agent_id,
+			 req->model, StrLen(req->model));
+
+	return req;
+}
+
+//--- Dispatch Engine ---
+
+CInferReq *InferPickNext()
+{//Select highest-priority queued request for dispatch.
+//System-priority requests bypass the queue.
+	I64			 i, best_idx;
+	I64			 best_priority;
+	CInferReq	*req;
+
+	best_idx = -1;
+	best_priority = -1;
+
+	for (i = 0; i < INFER_QUEUE_CAPACITY; i++)
+	{
+		req = &infer_queue.requests[i];
+		if (req->status != INFER_STATUS_QUEUED) continue;
+
+		//System priority always wins
+		if (Bt(&req->flags, INFERf_SYSTEM_PRIORITY))
+			return req;
+
+		if (req->priority > best_priority)
+		{
+			best_priority = req->priority;
+			best_idx = i;
+		}
+	}
+
+	if (best_idx >= 0)
+		return &infer_queue.requests[best_idx];
+	return NULL;
+}
+
+U0 InferDispatch()
+{//Dispatch next queued request to appropriate backend.
+//Called periodically or when new requests arrive.
+	CInferReq	*req;
+	CModelEntry	*model;
+
+	req = InferPickNext;
+	if (!req) return;
+
+	//Resolve model
+	if (!StrCompare(req->model, "auto"))
+		model = ModelAutoSelect(req->priority, req->agent_id);
+	else
+		model = ModelFind(req->model);
+
+	if (!model || !model->available)
+	{
+		req->status = INFER_STATUS_FAILED;
+		infer_queue.count--;
+		infer_queue.stats.total_failed++;
+		FluxEmit(I_FLUX_LLM_EVENT, FLUX_EVT_ERROR, req->agent_id,
+				 "NO_MODEL", 8);
+		if (req->callback)
+			(*req->callback)(req);
+		return;
+	}
+
+	req->status = INFER_STATUS_RUNNING;
+	req->start_tsc = TSCGet;
+
+	//Dispatch to backend
+	switch (model->backend)
+	{
+		case INFER_BACKEND_EXTERN:
+			//Phase 1: HTTP POST to model->endpoint
+			//For now, stub ΓÇö mark as failed with message
+			req->status = INFER_STATUS_FAILED;
+			infer_queue.count--;
+			infer_queue.stats.total_failed++;
+			model->total_errors++;
+			FluxEmit(I_FLUX_LLM_EVENT, FLUX_EVT_ERROR, req->agent_id,
+					 "NO_NETWORK", 10);
+			break;
+
+		case INFER_BACKEND_LOCAL_CPU:
+			//Phase 2: llama.cpp inference
+			req->status = INFER_STATUS_FAILED;
+			infer_queue.count--;
+			infer_queue.stats.total_failed++;
+			FluxEmit(I_FLUX_LLM_EVENT, FLUX_EVT_ERROR, req->agent_id,
+					 "NO_CPU_INFER", 12);
+			break;
+
+		case INFER_BACKEND_LOCAL_GPU:
+			//Phase 3: GPU compute dispatch
+			req->status = INFER_STATUS_FAILED;
+			infer_queue.count--;
+			infer_queue.stats.total_failed++;
+			FluxEmit(I_FLUX_LLM_EVENT, FLUX_EVT_ERROR, req->agent_id,
+					 "NO_GPU", 6);
+			break;
+
+		default:
+			req->status = INFER_STATUS_FAILED;
+			infer_queue.count--;
+			infer_queue.stats.total_failed++;
+			break;
+	}
+
+	//If completed (future backends), invoke callback
+	if (req->status == INFER_STATUS_COMPLETE)
+	{
+		req->complete_tsc = TSCGet;
+		infer_queue.count--;
+		infer_queue.stats.total_completed++;
+		model->total_requests++;
+
+		//Update running average latency
+		I64 latency = req->complete_tsc - req->start_tsc;
+		if (infer_queue.stats.avg_latency_tsc == 0)
+			infer_queue.stats.avg_latency_tsc = latency;
+		else
+			infer_queue.stats.avg_latency_tsc =
+				(infer_queue.stats.avg_latency_tsc * 7 + latency) / 8; //EMA
+
+		FluxEmit(I_FLUX_LLM_EVENT, FLUX_EVT_RESPONSE, req->agent_id,
+				 model->name, StrLen(model->name));
+
+		if (req->callback)
+			(*req->callback)(req);
+	}
+}
+
+//--- Convenience: Synchronous Inference ---
+
+CInferReq *InferSync(I64 agent_id, U8 *prompt, I64 prompt_len,
+					 U8 *model_name=NULL, I64 max_tokens=512)
+{//Submit and wait for inference to complete. Yields while waiting.
+//Returns completed request or NULL on failure.
+	CInferReq *req;
+
+	req = InferSubmit(agent_id, prompt, prompt_len, model_name, 5,
+					  max_tokens, 70, NULL);
+	if (!req) return NULL;
+
+	//Dispatch immediately
+	InferDispatch;
+
+	//Wait for completion (cooperative yield)
+	while (req->status == INFER_STATUS_QUEUED ||
+		   req->status == INFER_STATUS_RUNNING)
+	{
+		Yield;
+		InferDispatch; //keep dispatching
+	}
+
+	return req;
+}
+
+//--- GPU State ---
+
+CGPUState gpu_state;
+
+U0 GPUInit()
+{//Initialize GPU state. Phase 0: no GPUs.
+	MemSet(&gpu_state, 0, sizeof(CGPUState));
+}
+
+I64 GPUDetect()
+{//Scan PCI bus for known GPU devices.
+//Phase 3: populate gpu_state.devices[] from PCI enumeration.
+//Returns number of GPUs found.
+	//TODO Phase 3: Walk PCI bus, check for:
+	//  Intel Xe:   vendor=0x8086, class=0x03 (display) or 0x12 (processing accel)
+	//  AMD RDNA:   vendor=0x1002, class=0x03
+	//  NVIDIA:     vendor=0x10DE, class=0x03
+	return 0;
+}
+
+//--- Debug/Status ---
+
+U0 InferQueueDump()
+{//Print inference queue state.
+	I64 i;
+	CInferReq *req;
+
+	"=== Inference Queue (depth=%d/%d) ===\n",
+		infer_queue.count, INFER_QUEUE_CAPACITY;
+	"  Models registered: %d\n", infer_queue.model_count;
+
+	for (i = 0; i < infer_queue.model_count; i++)
+	{
+		"  [%d] %s  backend=%d quality=%d speed=%.1f avail=%s",
+			i, infer_queue.models[i].name,
+			infer_queue.models[i].backend,
+			infer_queue.models[i].quality,
+			infer_queue.models[i].speed,
+			infer_queue.models[i].available ? "YES" : "NO";
+		if (infer_queue.models[i].endpoint[0])
+			" endpoint=%s", infer_queue.models[i].endpoint;
+		"\n";
+	}
+
+	"  Queued requests:\n";
+	for (i = 0; i < INFER_QUEUE_CAPACITY; i++)
+	{
+		req = &infer_queue.requests[i];
+		if (req->status == INFER_STATUS_QUEUED ||
+			req->status == INFER_STATUS_RUNNING)
+		{
+			"    [%d] agent=%d model=%s priority=%d status=%d\n",
+				req->id, req->agent_id, req->model,
+				req->priority, req->status;
+		}
+	}
+
+	"  Stats: submitted=%d completed=%d failed=%d deduped=%d peak=%d\n",
+		infer_queue.stats.total_submitted,
+		infer_queue.stats.total_completed,
+		infer_queue.stats.total_failed,
+		infer_queue.stats.total_deduped,
+		infer_queue.stats.peak_depth;
+
+	if (gpu_state.device_count > 0)
+	{
+		"  GPUs: %d detected\n", gpu_state.device_count;
+		for (i = 0; i < gpu_state.device_count; i++)
+			"    [%d] %s  VRAM=%dMB/%dMB CUs=%d\n",
+				i, gpu_state.devices[i].name,
+				gpu_state.devices[i].vram_used_mb,
+				gpu_state.devices[i].vram_total_mb,
+				gpu_state.devices[i].compute_units;
+	}
+	else
+		"  GPUs: none (network offload or CPU inference only)\n";
+}

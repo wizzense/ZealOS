@@ -1,0 +1,255 @@
+/*ZealOS-AI: FluxIDT ΓÇö Interrupt-Driven Event Bus
+Absorbs AitherOS FluxEmitter + AitherEvents into kernel-native
+ring-buffer event system using IDT vectors 0x60-0x7F.
+
+Latency: ~0.1us (interrupt + ring write) vs AitherOS ~50us (Redis)
+
+Each vector gets a CFluxRing (lock-free SPSC ring buffer) and
+up to FLUX_MAX_HANDLERS chained handlers invoked on emit.
+*/
+
+CFluxVector		flux_vectors[FLUX_MAX_VECTORS];
+CFluxContextState flux_state;
+
+U0 FluxRingInit(CFluxRing *ring)
+{//Initialize a ring buffer to empty state.
+	ring->head = 0;
+	ring->tail = 0;
+	ring->capacity = FLUX_RING_CAPACITY;
+	ring->drop_count = 0;
+	ring->total_events = 0;
+}
+
+U0 FluxInit()
+{//Initialize all FluxIDT vectors and rings.
+	I64 i, j;
+
+	MemSet(&flux_state, 0, sizeof(CFluxContextState));
+	for (i = 0; i < FLUX_MAX_VECTORS; i++)
+	{
+		FluxRingInit(&flux_vectors[i].ring);
+		flux_vectors[i].handler_count = 0;
+		for (j = 0; j < FLUX_MAX_HANDLERS; j++)
+		{
+			flux_vectors[i].handlers[j].handler = NULL;
+			flux_vectors[i].handlers[j].agent_id = 0;
+		}
+	}
+	flux_state.valence = 0;
+	flux_state.arousal = 0;
+	flux_state.pain = 0;
+}
+
+Bool FluxEmit(I64 vector, I64 event_type, I64 source_agent,
+			  U8 *payload, I64 payload_len)
+{//Write event to ring buffer and invoke handlers.
+//Returns FALSE if ring is full (event dropped).
+	I64			 vec_idx, next_head, i;
+	CFluxVector	*fv;
+	CFluxRing	*ring;
+	CFluxEvent	*evt;
+
+	if (vector < I_FLUX_BASE || vector > I_FLUX_BASE + FLUX_MAX_VECTORS - 1)
+		return FALSE;
+
+	vec_idx = vector - I_FLUX_BASE;
+	fv = &flux_vectors[vec_idx];
+	ring = &fv->ring;
+
+	PUSHFD
+	CLI
+
+	//Check if ring is full
+	next_head = (ring->head + 1) % ring->capacity;
+	if (next_head == ring->tail)
+	{
+		ring->drop_count++;
+		POPFD
+		return FALSE;
+	}
+
+	//Write event into slot
+	evt = &ring->events[ring->head];
+	evt->timestamp = TSCGet;
+	evt->event_type = event_type;
+	evt->source_agent = source_agent;
+
+	if (payload && payload_len > 0)
+	{
+		if (payload_len > FLUX_PAYLOAD_SIZE)
+			payload_len = FLUX_PAYLOAD_SIZE;
+		MemCopy(evt->payload, payload, payload_len);
+		evt->payload_len = payload_len;
+	}
+	else
+		evt->payload_len = 0;
+
+	//Advance head (publish)
+	ring->head = next_head;
+	ring->total_events++;
+
+	//Invoke chained handlers
+	for (i = 0; i < fv->handler_count; i++)
+	{
+		if (fv->handlers[i].handler)
+		{
+			//handler_agent_id==0 means subscribe to all
+			if (fv->handlers[i].agent_id == 0 ||
+				fv->handlers[i].agent_id == source_agent)
+			{
+				(*fv->handlers[i].handler)(evt);
+			}
+		}
+	}
+
+	POPFD
+	return TRUE;
+}
+
+Bool FluxSubscribe(I64 vector, U0 (*handler_fn)(CFluxEvent *event),
+				   I64 agent_id=0)
+{//Register a handler for a FluxIDT vector.
+//agent_id=0 means receive all events on this vector.
+	I64			 vec_idx;
+	CFluxVector	*fv;
+
+	if (vector < I_FLUX_BASE || vector > I_FLUX_BASE + FLUX_MAX_VECTORS - 1)
+		return FALSE;
+
+	vec_idx = vector - I_FLUX_BASE;
+	fv = &flux_vectors[vec_idx];
+
+	if (fv->handler_count >= FLUX_MAX_HANDLERS)
+		return FALSE;
+
+	PUSHFD
+	CLI
+	fv->handlers[fv->handler_count].handler = handler_fn;
+	fv->handlers[fv->handler_count].agent_id = agent_id;
+	fv->handler_count++;
+	POPFD
+
+	return TRUE;
+}
+
+Bool FluxUnsubscribe(I64 vector, U0 (*handler_fn)(CFluxEvent *event))
+{//Remove a handler from a FluxIDT vector.
+	I64			 vec_idx, i, j;
+	CFluxVector	*fv;
+
+	if (vector < I_FLUX_BASE || vector > I_FLUX_BASE + FLUX_MAX_VECTORS - 1)
+		return FALSE;
+
+	vec_idx = vector - I_FLUX_BASE;
+	fv = &flux_vectors[vec_idx];
+
+	PUSHFD
+	CLI
+	for (i = 0; i < fv->handler_count; i++)
+	{
+		if (fv->handlers[i].handler == handler_fn)
+		{
+			//Shift remaining handlers down
+			for (j = i; j < fv->handler_count - 1; j++)
+				fv->handlers[j] = fv->handlers[j + 1];
+			fv->handler_count--;
+			fv->handlers[fv->handler_count].handler = NULL;
+			POPFD
+			return TRUE;
+		}
+	}
+	POPFD
+	return FALSE;
+}
+
+CFluxEvent *FluxPoll(I64 vector)
+{//Read next event from ring. Returns NULL if empty.
+//Caller must process before next FluxPoll on same vector.
+	I64			 vec_idx;
+	CFluxRing	*ring;
+	CFluxEvent	*evt;
+
+	if (vector < I_FLUX_BASE || vector > I_FLUX_BASE + FLUX_MAX_VECTORS - 1)
+		return NULL;
+
+	vec_idx = vector - I_FLUX_BASE;
+	ring = &flux_vectors[vec_idx].ring;
+
+	if (ring->tail == ring->head)
+		return NULL; //empty
+
+	evt = &ring->events[ring->tail];
+	ring->tail = (ring->tail + 1) % ring->capacity;
+	return evt;
+}
+
+U0 FluxSensation(F64 pain_delta, F64 pleasure_delta)
+{//Update system affect state and emit PAIN_PLEASURE event.
+//pain_delta > 0 increases pain, pleasure_delta > 0 improves valence.
+	U8 buf[64];
+
+	flux_state.pain += pain_delta;
+	if (flux_state.pain < 0) flux_state.pain = 0;
+	if (flux_state.pain > 1.0) flux_state.pain = 1.0;
+
+	flux_state.valence += pleasure_delta - pain_delta;
+	if (flux_state.valence < -1.0) flux_state.valence = -1.0;
+	if (flux_state.valence > 1.0) flux_state.valence = 1.0;
+
+	//Arousal increases with any strong sensation
+	flux_state.arousal += Abs(pain_delta) + Abs(pleasure_delta);
+	if (flux_state.arousal > 1.0) flux_state.arousal = 1.0;
+
+	flux_state.last_update = TSCGet;
+
+	//Emit event with current state
+	MemCopy(buf, &flux_state, MinI64(sizeof(CFluxContextState), 64));
+	FluxEmit(I_FLUX_PAIN_PLEASURE, FLUX_EVT_STATE_CHANGE, 0, buf, 64);
+}
+
+U0 FluxUpdateContext()
+{//Called periodically to update context state.
+	flux_state.uptime_jiffies = counts.jiffies;
+
+	//Decay arousal over time (half-life ~60s)
+	flux_state.arousal *= 0x3FEFAE147AE147AE(F64); //0.99
+
+	flux_state.last_update = TSCGet;
+}
+
+I64 FluxRingCount(I64 vector)
+{//Return number of pending events in a vector's ring.
+	I64		 vec_idx;
+	CFluxRing *ring;
+
+	if (vector < I_FLUX_BASE || vector > I_FLUX_BASE + FLUX_MAX_VECTORS - 1)
+		return -1;
+
+	vec_idx = vector - I_FLUX_BASE;
+	ring = &flux_vectors[vec_idx].ring;
+
+	if (ring->head >= ring->tail)
+		return ring->head - ring->tail;
+	else
+		return ring->capacity - ring->tail + ring->head;
+}
+
+U0 FluxDump(I64 vector)
+{//Debug: print ring stats for a vector.
+	I64		 vec_idx;
+	CFluxRing *ring;
+
+	if (vector < I_FLUX_BASE || vector > I_FLUX_BASE + FLUX_MAX_VECTORS - 1)
+	{
+		"FluxDump: invalid vector 0x%02X\n", vector;
+		return;
+	}
+
+	vec_idx = vector - I_FLUX_BASE;
+	ring = &flux_vectors[vec_idx].ring;
+	"FluxIDT[0x%02X]: head=%d tail=%d pending=%d total=%d drops=%d handlers=%d\n",
+		vector, ring->head, ring->tail,
+		FluxRingCount(vector),
+		ring->total_events, ring->drop_count,
+		flux_vectors[vec_idx].handler_count;
+}

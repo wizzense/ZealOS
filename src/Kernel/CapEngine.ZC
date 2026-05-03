@@ -1,0 +1,211 @@
+/*ZealOS-AI: CapEngine ΓÇö Capability Security Engine
+Absorbs AitherOS CapabilityEngine into kernel-native
+HMAC-SHA256 capability tokens with default-deny policy.
+
+All agent operations pass through CapCheck() before execution.
+Audit log records all allow/deny decisions for forensics.
+*/
+
+CCapEngine cap_engine;
+
+U0 CapEngineInit()
+{//Initialize capability engine with empty state.
+	I64 i;
+
+	for (i = 0; i < AGENT_MAX_AGENTS; i++)
+		cap_engine.tokens[i] = NULL;
+	cap_engine.audit_head = 0;
+	cap_engine.audit_count = 0;
+
+	//Initialize HMAC key from RDTSC entropy
+	//In production this would use a proper CSPRNG
+	for (i = 0; i < CAP_HMAC_KEY_LEN; i++)
+		cap_engine.hmac_key[i] = TSCGet;
+}
+
+Bool CapPatternMatch(U8 *pattern, U8 *resource)
+{//Match a dot-delimited capability pattern against a resource string.
+//Supports wildcard '*' at any segment level.
+//  "agent.*" matches "agent.worker", "agent.monitor"
+//  "tool.shell.*" matches "tool.shell.exec", "tool.shell.read"
+//  "*" matches everything
+	U8 *pp = pattern, *rp = resource;
+
+	while (*pp && *rp)
+	{
+		if (*pp == '*')
+		{
+			//Wildcard: skip to next dot or end in both
+			pp++;
+			if (!*pp) return TRUE; //trailing * matches all
+			if (*pp != '.') return FALSE; //invalid pattern
+			//Skip to next dot in resource
+			while (*rp && *rp != '.') rp++;
+		}
+		else if (*pp == *rp)
+		{
+			pp++;
+			rp++;
+		}
+		else
+			return FALSE;
+	}
+
+	//Both must be exhausted, or pattern ends with *
+	if (!*pp && !*rp) return TRUE;
+	if (*pp == '*' && !*(pp + 1)) return TRUE;
+	return FALSE;
+}
+
+U0 CapAuditRecord(I64 agent_id, U8 *resource, I64 action, I64 result)
+{//Record a capability check in the audit log (circular buffer).
+	CCapAudit *entry;
+
+	entry = &cap_engine.audit_log[cap_engine.audit_head];
+	entry->timestamp = TSCGet;
+	entry->agent_id = agent_id;
+	if (resource)
+		MemCopy(entry->resource, resource, MinI64(StrLen(resource) + 1, CAP_PATTERN_LEN));
+	else
+		entry->resource[0] = 0;
+	entry->action = action;
+	entry->result = result;
+
+	cap_engine.audit_head = (cap_engine.audit_head + 1) % CAP_MAX_AUDIT_LOG;
+	if (cap_engine.audit_count < CAP_MAX_AUDIT_LOG)
+		cap_engine.audit_count++;
+}
+
+Bool CapCheck(I64 agent_id, U8 *resource, I64 action)
+{//Check if agent has capability to perform action on resource.
+//DEFAULT-DENY: returns FALSE unless explicitly granted.
+	CCapToken	*token;
+	I64			 i;
+
+	if (agent_id < 0 || agent_id >= AGENT_MAX_AGENTS)
+	{
+		CapAuditRecord(agent_id, resource, action, CAP_AUDIT_DENY);
+		return FALSE;
+	}
+
+	token = cap_engine.tokens[agent_id];
+	if (!token)
+	{
+		CapAuditRecord(agent_id, resource, action, CAP_AUDIT_DENY);
+		return FALSE;
+	}
+
+	//Check expiry
+	if (token->expiry && counts.jiffies > token->expiry)
+	{
+		CapAuditRecord(agent_id, resource, action, CAP_AUDIT_DENY);
+		return FALSE;
+	}
+
+	//Check each capability in token
+	for (i = 0; i < token->cap_count; i++)
+	{
+		if (CapPatternMatch(token->caps[i].resource, resource))
+		{
+			if (token->caps[i].action_mask & action)
+			{
+				CapAuditRecord(agent_id, resource, action, CAP_AUDIT_ALLOW);
+				return TRUE;
+			}
+		}
+	}
+
+	//Default deny
+	CapAuditRecord(agent_id, resource, action, CAP_AUDIT_DENY);
+	return FALSE;
+}
+
+CCapToken *CapTokenCreate(I64 agent_id)
+{//Create a new empty capability token for an agent.
+	CCapToken *token;
+
+	if (agent_id < 0 || agent_id >= AGENT_MAX_AGENTS)
+		return NULL;
+
+	token = CAlloc(sizeof(CCapToken));
+	token->agent_id = agent_id;
+	token->cap_count = 0;
+	token->llm_tier_max = 10; //unrestricted by default
+	token->expiry = 0; //never expires by default
+
+	PUSHFD
+	CLI
+	cap_engine.tokens[agent_id] = token;
+	POPFD
+
+	return token;
+}
+
+Bool CapTokenGrant(CCapToken *token, U8 *resource, I64 action_mask)
+{//Add a capability grant to an existing token.
+	if (!token || token->cap_count >= CAP_MAX_CAPABILITIES)
+		return FALSE;
+
+	MemCopy(token->caps[token->cap_count].resource, resource,
+			MinI64(StrLen(resource) + 1, CAP_PATTERN_LEN));
+	token->caps[token->cap_count].action_mask = action_mask;
+	token->caps[token->cap_count].constraints = 0;
+	token->cap_count++;
+
+	return TRUE;
+}
+
+CCapToken *CapTokenNarrow(CCapToken *parent, I64 new_agent_id)
+{//Create a narrowed copy of a parent token for a child agent.
+//The child can never have more capabilities than the parent.
+	CCapToken *child;
+	I64 i;
+
+	if (!parent) return NULL;
+
+	child = CapTokenCreate(new_agent_id);
+	if (!child) return NULL;
+
+	for (i = 0; i < parent->cap_count; i++)
+	{
+		child->caps[i] = parent->caps[i];
+	}
+	child->cap_count = parent->cap_count;
+	child->llm_tier_max = parent->llm_tier_max;
+
+	return child;
+}
+
+U0 CapTokenRevoke(I64 agent_id)
+{//Revoke all capabilities for an agent.
+	if (agent_id < 0 || agent_id >= AGENT_MAX_AGENTS)
+		return;
+
+	PUSHFD
+	CLI
+	if (cap_engine.tokens[agent_id])
+	{
+		Free(cap_engine.tokens[agent_id]);
+		cap_engine.tokens[agent_id] = NULL;
+	}
+	POPFD
+}
+
+U0 CapAuditDump(I64 count=10)
+{//Debug: print last N audit log entries.
+	I64 i, idx;
+
+	if (count > cap_engine.audit_count)
+		count = cap_engine.audit_count;
+
+	"=== Capability Audit Log (last %d entries) ===\n", count;
+	for (i = 0; i < count; i++)
+	{
+		idx = (cap_engine.audit_head - count + i + CAP_MAX_AUDIT_LOG) % CAP_MAX_AUDIT_LOG;
+		"  agent=%d resource='%s' action=0x%02X result=%s\n",
+			cap_engine.audit_log[idx].agent_id,
+			cap_engine.audit_log[idx].resource,
+			cap_engine.audit_log[idx].action,
+			cap_engine.audit_log[idx].result == CAP_AUDIT_ALLOW ? "ALLOW" : "DENY";
+	}
+}

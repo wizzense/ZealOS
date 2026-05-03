@@ -37,3 +37,12 @@ U8		*(*fp_getstr2)(I64 flags=0);
 U0		 (*fp_update_ctrls)(CTask *task);
 CDoc	*(*fp_doc_put)(CTask *task=NULL);
 U0		 (*fp_set_std_palette)();
+
+//=============================================================================
+// ZealOS-AI Globals
+//=============================================================================
+
+CKernelState	 kernel_state;	//Central AI kernel state
+//flux_vectors and flux_state are in FluxIDT.ZC
+//cap_engine is in CapEngine.ZC
+//identities are in AgentForge.ZC

@@ -57,6 +57,11 @@
 #include "BlkDev/MakeBlkDev"
 #include "FunSeg"
 #include "SMBIOS"
+#include "FluxIDT"
+#include "CapEngine"
+#include "AgentForge"
+#include "InferQueue"
+#include "Syscall"
 #include "KMain"
 
 #exe {KConfigDel(kernel_config);};

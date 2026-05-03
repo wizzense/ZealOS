@@ -1,0 +1,187 @@
+/*ZealOS-AI Phase 0 Demo: Agent as Kernel Object
+Validates all Phase 0 primitives:
+1. Agent spawning from identities
+2. AgentTick scheduling with priority scoring
+3. FluxIDT event emission and subscription
+4. Capability engine default-deny enforcement
+5. ForgeDispatch with depth limiting
+6. SlotPool resource semaphores
+7. Pain-driven priority shifting
+*/
+
+//--- Demo task actions ---
+
+I64 demo_work_counter = 0;
+I64 demo_monitor_counter = 0;
+I64 demo_events_received = 0;
+
+U0 DemoWorkAction(U8 *data)
+{//Worker task: increment counter and report.
+	no_warn data;
+	demo_work_counter++;
+	"  [worker] Executed task #%d\n", demo_work_counter;
+	FluxEmit(I_FLUX_AGENT_EVENT, FLUX_EVT_INFO, 1, //agent_id=1 (worker)
+			 "WORK_DONE", 9);
+}
+
+U0 DemoMonitorAction(U8 *data)
+{//Monitor task: check agent health.
+	no_warn data;
+	demo_monitor_counter++;
+	"  [monitor] Health check #%d ΓÇö agents=%d pain=%.2f\n",
+		demo_monitor_counter,
+		kernel_state.agent_count,
+		kernel_state.system_pain;
+}
+
+U0 DemoFluxHandler(CFluxEvent *event)
+{//Event handler: count received events.
+	demo_events_received++;
+}
+
+//--- Main demo ---
+
+U0 AgentDemo()
+{
+	CForgeSpec		 spec;
+	CForgeSession	*session;
+	I64				 i;
+	Bool			 result;
+
+	"\n";
+	"============================================\n";
+	"  ZealOS-AI Phase 0 Demo\n";
+	"  Agent as Kernel Object\n";
+	"============================================\n\n";
+
+	//--- Test 1: Verify agents spawned at boot ---
+	"[TEST 1] Agent Registry\n";
+	AgentListDump;
+	if (kernel_state.agent_count == 3)
+		"  PASS: 3 agents spawned\n\n";
+	else
+		"  FAIL: expected 3 agents, got %d\n\n", kernel_state.agent_count;
+
+	//--- Test 2: Register tasks and run AgentTick ---
+	"[TEST 2] AgentTick Scheduling\n";
+	//Add tasks to worker agent (agent_id=1)
+	AgentTaskAdd(1, 3, 0, &DemoWorkAction, NULL, 0);
+	AgentTaskAdd(1, 5, 0, &DemoWorkAction, NULL, 1); //linked to goal
+
+	//Add health check to monitor (agent_id=2)
+	AgentTaskAdd(2, 1, 0, &DemoMonitorAction);
+
+	//Run 3 ticks
+	for (i = 0; i < 3; i++)
+	{
+		"  --- Tick %d ---\n", i + 1;
+		AgentTick;
+	}
+	if (demo_work_counter > 0 && demo_monitor_counter > 0)
+		"  PASS: Tasks dispatched (work=%d, monitor=%d)\n\n",
+			demo_work_counter, demo_monitor_counter;
+	else
+		"  FAIL: No tasks dispatched\n\n";
+
+	//--- Test 3: FluxIDT Event Bus ---
+	"[TEST 3] FluxIDT Event Bus\n";
+	FluxSubscribe(I_FLUX_AGENT_EVENT, &DemoFluxHandler);
+	FluxEmit(I_FLUX_AGENT_EVENT, FLUX_EVT_INFO, 0, "TEST_EVENT", 10);
+	FluxEmit(I_FLUX_AGENT_EVENT, FLUX_EVT_INFO, 0, "TEST_EVENT2", 11);
+	if (demo_events_received >= 2)
+		"  PASS: %d events received via FluxIDT\n\n", demo_events_received;
+	else
+		"  FAIL: expected >=2 events, got %d\n\n", demo_events_received;
+	FluxDump(I_FLUX_AGENT_EVENT);
+	"\n";
+
+	//--- Test 4: Capability Engine ---
+	"[TEST 4] Capability Engine (Default-Deny)\n";
+	//Worker (agent_id=1) should have tool.* execute
+	result = CapCheck(1, "tool.shell.exec", CAPa_EXECUTE);
+	"  Worker tool.shell.exec EXECUTE: %s\n",
+		result ? "ALLOW (PASS)" : "DENY (FAIL)";
+
+	//Worker should NOT have agent.* spawn
+	result = CapCheck(1, "agent.new", CAPa_SPAWN);
+	"  Worker agent.new SPAWN: %s\n",
+		result ? "ALLOW (FAIL)" : "DENY (PASS)";
+
+	//Monitor (agent_id=2) should have read-only
+	result = CapCheck(2, "agent.status", CAPa_READ);
+	"  Monitor agent.status READ: %s\n",
+		result ? "ALLOW (PASS)" : "DENY (FAIL)";
+
+	result = CapCheck(2, "tool.shell.exec", CAPa_EXECUTE);
+	"  Monitor tool.shell.exec EXECUTE: %s\n",
+		result ? "ALLOW (FAIL)" : "DENY (PASS)";
+
+	//Unregistered agent should be denied everything
+	result = CapCheck(99, "anything", CAPa_READ);
+	"  Unknown agent READ: %s\n\n",
+		result ? "ALLOW (FAIL)" : "DENY (PASS)";
+
+	CapAuditDump(5);
+	"\n";
+
+	//--- Test 5: ForgeDispatch Depth Limiting ---
+	"[TEST 5] ForgeDispatch + Depth Limiting\n";
+	MemSet(&spec, 0, sizeof(CForgeSpec));
+	StrCopy(spec.agent_type, "worker");
+	StrCopy(spec.task_desc, "demo subtask");
+	spec.effort = 3;
+
+	//Depth 0 -> should succeed
+	session = ForgeDispatch(&spec, 0);
+	"  ForgeDispatch depth=0: %s\n",
+		session ? "OK (PASS)" : "FAILED (FAIL)";
+
+	//Depth 3 -> should be rejected (FORGE_MAX_DEPTH=3)
+	session = ForgeDispatch(&spec, 3);
+	"  ForgeDispatch depth=3: %s\n\n",
+		session ? "SPAWNED (FAIL)" : "REJECTED (PASS)";
+
+	//--- Test 6: SlotPool ---
+	"[TEST 6] SlotPool Resource Semaphores\n";
+	"  CPU slots: %d/%d\n",
+		kernel_state.slots.used[SLOT_TYPE_CPU],
+		kernel_state.slots.total[SLOT_TYPE_CPU];
+
+	//Grant slot capability to worker
+	CapTokenGrant(cap_engine.tokens[1], "slot.*", CAPa_EXECUTE);
+
+	result = SlotAcquire(SLOT_TYPE_CPU, 1);
+	"  SlotAcquire CPU (worker): %s  used=%d/%d\n",
+		result ? "OK" : "DENIED",
+		kernel_state.slots.used[SLOT_TYPE_CPU],
+		kernel_state.slots.total[SLOT_TYPE_CPU];
+
+	SlotRelease(SLOT_TYPE_CPU);
+	"  SlotRelease CPU: used=%d/%d\n\n",
+		kernel_state.slots.used[SLOT_TYPE_CPU],
+		kernel_state.slots.total[SLOT_TYPE_CPU];
+
+	//--- Test 7: Pain-Driven Priority ---
+	"[TEST 7] Pain-Driven Priority Shift\n";
+	//Inject high pain
+	kernel_state.agents[0]->pain = 0.9;
+	kernel_state.agents[1]->pain = 0.8;
+	"  Injected pain: orchestrator=0.9, worker=0.8\n";
+	AgentTick;
+	"  System pain after tick: %.2f\n", kernel_state.system_pain;
+	"  Monitor healing flag: %s\n\n",
+		Bt(&kernel_state.agents[2]->agent_flags, AGENTf_HEALING) ?
+		"SET (PASS)" : "NOT SET (FAIL)";
+
+	//--- Summary ---
+	"============================================\n";
+	"  Phase 0 Demo Complete\n";
+	"  Ticks: %d  Dispatches: %d\n",
+		kernel_state.total_ticks, kernel_state.total_dispatches;
+	"  Flux events total: %d\n",
+		flux_vectors[I_FLUX_AGENT_EVENT - I_FLUX_BASE].ring.total_events;
+	"============================================\n";
+
+	//Final state dump
+	AgentListDump;
+}

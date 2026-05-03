@@ -332,3 +332,5 @@ U0 TaskQueueInsChild(CTask *task)
 	task->next_sibling_task = pred;
 	POPFD
 }
+
+//AgentTick scheduling is in AgentForge.ZC (included after FluxIDT.ZC)

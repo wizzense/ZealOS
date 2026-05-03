@@ -1,0 +1,593 @@
+/*ZealOS-AI: AgentForge ΓÇö Identity System + Agent Spawning
+Absorbs AitherOS IdentitySystem + AgentForge into kernel-native
+agent lifecycle management.
+
+Identities are compiled from config at boot and stored in the
+kernel hash table. ForgeDispatch creates agents with identity-driven
+capability narrowing and depth-limited spawn chains.
+*/
+
+CIdentity	 identities[IDENTITY_MAX];
+I64			 identity_count = 0;
+CForgeSession forge_sessions[FORGE_MAX_SESSIONS];
+I64			 forge_session_count = 0;
+I64			 forge_next_session_id = 1;
+
+//Forward declaration ΓÇö kernel_state is in KGlobals
+extern CKernelState kernel_state;
+
+U0 IdentityInit()
+{//Initialize identity system.
+	I64 i;
+	identity_count = 0;
+	for (i = 0; i < IDENTITY_MAX; i++)
+		MemSet(&identities[i], 0, sizeof(CIdentity));
+	for (i = 0; i < FORGE_MAX_SESSIONS; i++)
+	{
+		MemSet(&forge_sessions[i], 0, sizeof(CForgeSession));
+		forge_sessions[i].status = FORGE_STATUS_PENDING;
+	}
+}
+
+I64 IdentityRegister(U8 *name, I64 role, I64 effort_cap,
+					 I64 hourly_budget, I64 daily_budget, I64 flags)
+{//Register a new identity. Returns identity index or -1 on failure.
+	CIdentity *id;
+
+	if (identity_count >= IDENTITY_MAX)
+		return -1;
+	if (!name || !*name)
+		return -1;
+
+	id = &identities[identity_count];
+	MemCopy(id->name, name, MinI64(StrLen(name) + 1, AGENT_NAME_LEN));
+	id->role = role;
+	id->effort_cap = effort_cap;
+	id->hourly_budget = hourly_budget;
+	id->daily_budget = daily_budget;
+	id->flags = flags;
+	id->skill_count = 0;
+	StrCopy(id->tool_profile, "full");
+
+	return identity_count++;
+}
+
+CIdentity *IdentityGet(U8 *name)
+{//Look up identity by name. Returns NULL if not found.
+	I64 i;
+
+	for (i = 0; i < identity_count; i++)
+	{
+		if (!StrCompare(identities[i].name, name))
+			return &identities[i];
+	}
+	return NULL;
+}
+
+Bool IdentityAddSkill(U8 *identity_name, U8 *skill)
+{//Add a skill to an identity's skill list.
+	CIdentity *id = IdentityGet(identity_name);
+	if (!id || id->skill_count >= AGENT_MAX_SKILLS)
+		return FALSE;
+
+	MemCopy(id->skills[id->skill_count], skill,
+			MinI64(StrLen(skill) + 1, AGENT_NAME_LEN));
+	id->skill_count++;
+	return TRUE;
+}
+
+U0 IdentitiesLoadDefaults()
+{//Register the 3 default Phase 0 identities.
+	I64 idx;
+
+	//Orchestrator ΓÇö can spawn children, high budget
+	idx = IdentityRegister("orchestrator", AGENT_ROLE_ORCHESTRATOR,
+						   10, 100, 1000,
+						   (1 << AGENTf_ACTIVE) | (1 << AGENTf_CAN_SPAWN) |
+						   (1 << AGENTf_CAN_DELEGATE));
+	if (idx >= 0)
+	{
+		IdentityAddSkill("orchestrator", "scheduling");
+		IdentityAddSkill("orchestrator", "delegation");
+		IdentityAddSkill("orchestrator", "planning");
+	}
+
+	//Worker ΓÇö cannot spawn, moderate budget
+	idx = IdentityRegister("worker", AGENT_ROLE_WORKER,
+						   7, 50, 500,
+						   (1 << AGENTf_ACTIVE));
+	if (idx >= 0)
+	{
+		IdentityAddSkill("worker", "execution");
+		IdentityAddSkill("worker", "reporting");
+	}
+
+	//Monitor ΓÇö cannot spawn, low budget, read-only tools
+	idx = IdentityRegister("monitor", AGENT_ROLE_MONITOR,
+						   3, 20, 200,
+						   (1 << AGENTf_ACTIVE));
+	if (idx >= 0)
+	{
+		IdentityAddSkill("monitor", "health_check");
+		IdentityAddSkill("monitor", "alerting");
+		identities[idx].tool_profile[0] = 0;
+		StrCopy(identities[idx].tool_profile, "readonly");
+	}
+}
+
+//--- Agent Lifecycle ---
+
+I64 AgentNextId()
+{//Allocate next agent ID. Thread-safe via CLI.
+	I64 i;
+	PUSHFD
+	CLI
+	for (i = 0; i < AGENT_MAX_AGENTS; i++)
+	{
+		if (!kernel_state.agents[i])
+		{
+			POPFD
+			return i;
+		}
+	}
+	POPFD
+	return -1;
+}
+
+CAgentMeta *AgentSpawn(U8 *identity_name, I64 parent_depth=0)
+{//Create a new agent from an identity template.
+//Returns NULL if identity not found, no slots, or depth exceeded.
+	CIdentity	*id;
+	CAgentMeta	*agent;
+	CCapToken	*token;
+	I64			 agent_id, i;
+
+	id = IdentityGet(identity_name);
+	if (!id) return NULL;
+
+	agent_id = AgentNextId();
+	if (agent_id < 0) return NULL;
+
+	agent = CAlloc(sizeof(CAgentMeta));
+	MemCopy(agent->name, id->name, AGENT_NAME_LEN);
+	agent->agent_id = agent_id;
+	agent->agent_flags = id->flags;
+	agent->role = id->role;
+	agent->effort_cap = id->effort_cap;
+	agent->hourly_budget = id->hourly_budget;
+	agent->daily_budget = id->daily_budget;
+	agent->hourly_used = 0;
+	agent->daily_used = 0;
+	agent->pain = 0;
+	agent->cooldown = 0;
+	agent->spawn_depth = parent_depth;
+	agent->task_count = 0;
+	agent->last_tick = 0;
+
+	//Copy skills
+	for (i = 0; i < id->skill_count && i < AGENT_MAX_SKILLS; i++)
+		MemCopy(agent->skills[i], id->skills[i], AGENT_NAME_LEN);
+	agent->skill_count = id->skill_count;
+
+	//Create capability token based on role
+	token = CapTokenCreate(agent_id);
+	if (token)
+	{
+		switch (id->role)
+		{
+			case AGENT_ROLE_ORCHESTRATOR:
+				CapTokenGrant(token, "agent.*", CAPa_READ | CAPa_WRITE | CAPa_EXECUTE | CAPa_SPAWN);
+				CapTokenGrant(token, "tool.*", CAPa_READ | CAPa_EXECUTE);
+				CapTokenGrant(token, "goal.*", CAPa_READ | CAPa_WRITE);
+				CapTokenGrant(token, "flux.*", CAPa_READ | CAPa_WRITE);
+				CapTokenGrant(token, "infer.*", CAPa_EXECUTE);
+				CapTokenGrant(token, "slot.*", CAPa_EXECUTE);
+				break;
+
+			case AGENT_ROLE_WORKER:
+				CapTokenGrant(token, "tool.*", CAPa_READ | CAPa_EXECUTE);
+				CapTokenGrant(token, "flux.*", CAPa_READ | CAPa_WRITE);
+				CapTokenGrant(token, "goal.*", CAPa_READ);
+				CapTokenGrant(token, "infer.*", CAPa_EXECUTE);
+				CapTokenGrant(token, "slot.*", CAPa_EXECUTE);
+				break;
+
+			case AGENT_ROLE_MONITOR:
+				CapTokenGrant(token, "agent.*", CAPa_READ);
+				CapTokenGrant(token, "flux.*", CAPa_READ);
+				CapTokenGrant(token, "goal.*", CAPa_READ);
+				break;
+
+			default:
+				CapTokenGrant(token, "flux.*", CAPa_READ);
+				break;
+		}
+		token->llm_tier_max = id->effort_cap;
+	}
+
+	//Register in kernel state
+	PUSHFD
+	CLI
+	kernel_state.agents[agent_id] = agent;
+	kernel_state.agent_count++;
+	POPFD
+
+	//Emit birth event
+	FluxEmit(I_FLUX_AGENT_EVENT, FLUX_EVT_STATE_CHANGE, agent_id,
+			 agent->name, StrLen(agent->name));
+
+	return agent;
+}
+
+U0 AgentKill(I64 agent_id)
+{//Terminate an agent and reclaim resources.
+	CAgentMeta *agent;
+
+	if (agent_id < 0 || agent_id >= AGENT_MAX_AGENTS)
+		return;
+
+	agent = kernel_state.agents[agent_id];
+	if (!agent) return;
+
+	//Emit death event before cleanup
+	FluxEmit(I_FLUX_AGENT_EVENT, FLUX_EVT_STATE_CHANGE, agent_id,
+			 "KILLED", 6);
+
+	//Revoke capabilities
+	CapTokenRevoke(agent_id);
+
+	//Kill the CTask if one exists
+	if (agent->task && TaskValidate(agent->task))
+		Kill(agent->task, FALSE);
+
+	PUSHFD
+	CLI
+	kernel_state.agents[agent_id] = NULL;
+	kernel_state.agent_count--;
+	POPFD
+
+	Free(agent);
+}
+
+Bool AgentTaskAdd(I64 agent_id, I64 effort, I64 interval,
+				  U0 (*action)(U8 *data), U8 *data=NULL, I64 goal_id=0)
+{//Register a task in an agent's portfolio.
+	CAgentMeta	*agent;
+	CAgentTask	*at;
+
+	if (agent_id < 0 || agent_id >= AGENT_MAX_AGENTS)
+		return FALSE;
+
+	agent = kernel_state.agents[agent_id];
+	if (!agent || agent->task_count >= AGENT_MAX_TASKS)
+		return FALSE;
+
+	if (effort > agent->effort_cap)
+		return FALSE; //exceeds agent's effort cap
+
+	at = &agent->tasks[agent->task_count];
+	at->id = agent->task_count;
+	at->effort = effort;
+	at->interval = interval;
+	at->last_run = 0;
+	at->goal_id = goal_id;
+	at->action = action;
+	at->data = data;
+	at->run_count = 0;
+	at->fail_count = 0;
+
+	agent->task_count++;
+	return TRUE;
+}
+
+//--- ForgeDispatch ---
+
+CForgeSession *ForgeDispatch(CForgeSpec *spec, I64 parent_depth=0)
+{//Spawn a new agent via forge with identity + capability narrowing.
+//Enforces FORGE_MAX_DEPTH to prevent unbounded spawn chains.
+	CAgentMeta		*agent;
+	CForgeSession	*session;
+	I64				 session_idx;
+
+	if (!spec) return NULL;
+
+	//Depth check
+	if (parent_depth >= FORGE_MAX_DEPTH)
+	{
+		FluxEmit(I_FLUX_SECURITY, FLUX_EVT_WARNING, 0,
+				 "ForgeDispatch depth exceeded", 29);
+		return NULL;
+	}
+
+	//Check if identity exists
+	if (!IdentityGet(spec->agent_type))
+		return NULL;
+
+	//Check can_spawn capability of parent
+	//agent_id 0 is system, always allowed
+	//TODO: check parent's CAPa_SPAWN
+
+	//Find free session slot
+	session_idx = -1;
+	for (session_idx = 0; session_idx < FORGE_MAX_SESSIONS; session_idx++)
+	{
+		if (forge_sessions[session_idx].status == FORGE_STATUS_PENDING ||
+			forge_sessions[session_idx].status == FORGE_STATUS_COMPLETE ||
+			forge_sessions[session_idx].status == FORGE_STATUS_FAILED ||
+			forge_sessions[session_idx].status == FORGE_STATUS_TIMEOUT)
+			break;
+	}
+	if (session_idx >= FORGE_MAX_SESSIONS)
+		return NULL;
+
+	//Spawn agent
+	agent = AgentSpawn(spec->agent_type, parent_depth + 1);
+	if (!agent)
+		return NULL;
+
+	//Setup session
+	session = &forge_sessions[session_idx];
+	session->id = forge_next_session_id++;
+	session->status = FORGE_STATUS_RUNNING;
+	session->depth = parent_depth + 1;
+	session->task = agent->task;
+	session->start_jiffy = counts.jiffies;
+	session->end_jiffy = 0;
+	session->parent_agent = 0; //TODO: pass from parent
+	session->result[0] = 0;
+	forge_session_count++;
+
+	kernel_state.total_dispatches++;
+
+	FluxEmit(I_FLUX_AGENT_EVENT, FLUX_EVT_INFO, agent->agent_id,
+			 "FORGE_DISPATCH", 14);
+
+	return session;
+}
+
+//--- Slot Pool (Resource Semaphores) ---
+
+U0 SlotPoolInit(I64 gpu_slots, I64 cpu_slots, I64 io_slots)
+{//Initialize slot pool with available resource counts.
+	kernel_state.slots.total[SLOT_TYPE_GPU] = gpu_slots;
+	kernel_state.slots.total[SLOT_TYPE_CPU] = cpu_slots;
+	kernel_state.slots.total[SLOT_TYPE_IO] = io_slots;
+	kernel_state.slots.used[SLOT_TYPE_GPU] = 0;
+	kernel_state.slots.used[SLOT_TYPE_CPU] = 0;
+	kernel_state.slots.used[SLOT_TYPE_IO] = 0;
+	kernel_state.slots.waiters[SLOT_TYPE_GPU] = 0;
+	kernel_state.slots.waiters[SLOT_TYPE_CPU] = 0;
+	kernel_state.slots.waiters[SLOT_TYPE_IO] = 0;
+}
+
+Bool SlotAcquire(I64 slot_type, I64 agent_id)
+{//Acquire a resource slot. Blocks (yields) until available.
+//Returns FALSE if agent lacks capability.
+	if (slot_type < 0 || slot_type >= SLOT_TYPES_NUM)
+		return FALSE;
+
+	//Capability check
+	if (!CapCheck(agent_id, "slot.*", CAPa_EXECUTE))
+		return FALSE;
+
+	//Spin-wait with yield until slot available
+	kernel_state.slots.waiters[slot_type]++;
+	while (kernel_state.slots.used[slot_type] >= kernel_state.slots.total[slot_type])
+		Yield;
+	kernel_state.slots.waiters[slot_type]--;
+
+	PUSHFD
+	CLI
+	kernel_state.slots.used[slot_type]++;
+	POPFD
+
+	return TRUE;
+}
+
+U0 SlotRelease(I64 slot_type)
+{//Release a resource slot.
+	if (slot_type < 0 || slot_type >= SLOT_TYPES_NUM)
+		return;
+
+	PUSHFD
+	CLI
+	if (kernel_state.slots.used[slot_type] > 0)
+		kernel_state.slots.used[slot_type]--;
+	POPFD
+}
+
+//=============================================================================
+// AgentTick ΓÇö Priority+Effort+Budget Agent Scheduler
+// Called periodically (~30s) to select and dispatch highest-priority tasks.
+// score = staleness * W1 + pain * W2 + goal_boost * W3 - effort_cost * W4
+//=============================================================================
+
+F64 AgentScoreTask(CAgentMeta *agent, CAgentTask *at)
+{//Calculate priority score for an agent task.
+//Higher score = should run sooner.
+	F64 staleness, pain_urgency, goal_boost, effort_cost, score;
+	I64 age;
+
+	//Staleness: how long since last run (normalized to ticks)
+	age = counts.jiffies - at->last_run;
+	if (at->interval > 0)
+		staleness = ToF64(age) / ToF64(at->interval);
+	else
+		staleness = ToF64(age) / ToF64(AGENT_TICK_JIFFIES);
+	if (staleness > 10.0) staleness = 10.0;
+
+	//Pain urgency: agent's pain drives priority
+	pain_urgency = agent->pain * 10.0;
+
+	//Goal boost: tasks linked to goals get priority
+	if (at->goal_id > 0)
+		goal_boost = 5.0;
+	else
+		goal_boost = 0;
+
+	//Effort cost: higher effort tasks cost more
+	effort_cost = ToF64(at->effort);
+
+	score = staleness  * AGENT_W_STALENESS +
+			pain_urgency * AGENT_W_PAIN +
+			goal_boost * AGENT_W_GOAL -
+			effort_cost * AGENT_W_EFFORT_COST;
+
+	return score;
+}
+
+U0 AgentTick()
+{//Agent scheduler tick ΓÇö select and dispatch highest-priority agent tasks.
+	I64			 i, j, best_agent, best_task;
+	F64			 best_score, score;
+	CAgentMeta	*agent, *ba;
+	CAgentTask	*at;
+
+	kernel_state.total_ticks++;
+
+	//Update system metrics
+	kernel_state.running_count = 0;
+	kernel_state.system_pain = 0;
+
+	for (i = 0; i < AGENT_MAX_AGENTS; i++)
+	{
+		agent = kernel_state.agents[i];
+		if (!agent) continue;
+		if (!Bt(&agent->agent_flags, AGENTf_ACTIVE)) continue;
+		if (Bt(&agent->agent_flags, AGENTf_SUSPENDED)) continue;
+
+		kernel_state.running_count++;
+		kernel_state.system_pain += agent->pain;
+	}
+
+	if (kernel_state.running_count > 0)
+		kernel_state.system_pain /= ToF64(kernel_state.running_count);
+
+	//Update flux context state
+	flux_state.active_agents = kernel_state.running_count;
+	flux_state.pain = kernel_state.system_pain;
+	FluxUpdateContext;
+
+	//Find highest-scoring task across all agents
+	best_score = -999999.0;
+	best_agent = -1;
+	best_task = -1;
+
+	for (i = 0; i < AGENT_MAX_AGENTS; i++)
+	{
+		agent = kernel_state.agents[i];
+		if (!agent) continue;
+		if (!Bt(&agent->agent_flags, AGENTf_ACTIVE)) continue;
+		if (Bt(&agent->agent_flags, AGENTf_SUSPENDED)) continue;
+
+		//Check cooldown
+		if (agent->cooldown > 0)
+		{
+			agent->cooldown--;
+			continue;
+		}
+
+		//Check budget
+		if (agent->hourly_used >= agent->hourly_budget)
+			continue;
+
+		for (j = 0; j < agent->task_count; j++)
+		{
+			at = &agent->tasks[j];
+			if (!at->action) continue;
+
+			//Check interval
+			if (at->interval > 0 &&
+				(counts.jiffies - at->last_run) < at->interval)
+				continue;
+
+			score = AgentScoreTask(agent, at);
+			if (score > best_score)
+			{
+				best_score = score;
+				best_agent = i;
+				best_task = j;
+			}
+		}
+	}
+
+	//Dispatch best task
+	if (best_agent >= 0 && best_task >= 0)
+	{
+		ba = kernel_state.agents[best_agent];
+		at = &ba->tasks[best_task];
+
+		//Budget accounting
+		ba->hourly_used += at->effort;
+		ba->daily_used += at->effort;
+
+		//Execute task action
+		at->last_run = counts.jiffies;
+		at->run_count++;
+		ba->last_tick = counts.jiffies;
+
+		//Call the action function
+		try
+		{
+			(*at->action)(at->data);
+		}
+		catch
+		{
+			at->fail_count++;
+			ba->pain += 0.1;
+			if (ba->pain > 1.0) ba->pain = 1.0;
+			FluxEmit(I_FLUX_AGENT_EVENT, FLUX_EVT_ERROR, ba->agent_id,
+					 "TASK_FAILED", 11);
+		}
+	}
+
+	//Pain-driven healing: if system pain > 0.7, boost healing agents
+	if (kernel_state.system_pain > 0x3FE6666666666666(F64)) //0.7
+	{
+		for (i = 0; i < AGENT_MAX_AGENTS; i++)
+		{
+			agent = kernel_state.agents[i];
+			if (agent && agent->role == AGENT_ROLE_MONITOR)
+			{
+				LBts(&agent->agent_flags, AGENTf_HEALING);
+				agent->pain = kernel_state.system_pain; //mirror system pain
+			}
+		}
+		FluxSensation(0.1, 0); //register pain
+	}
+
+	//Emit heartbeat
+	FluxEmit(I_FLUX_SVC_HEALTH, FLUX_EVT_HEARTBEAT, 0, NULL, 0);
+}
+
+//--- Debug/Status ---
+
+U0 AgentListDump()
+{//Print all active agents and their state.
+	I64 i, j;
+	CAgentMeta *agent;
+
+	"=== ZealOS-AI Agent Registry (%d agents) ===\n", kernel_state.agent_count;
+	for (i = 0; i < AGENT_MAX_AGENTS; i++)
+	{
+		agent = kernel_state.agents[i];
+		if (agent)
+		{
+			"  [%d] %s  role=%d effort_cap=%d pain=%.2f tasks=%d depth=%d",
+				agent->agent_id, agent->name, agent->role,
+				agent->effort_cap, agent->pain, agent->task_count,
+				agent->spawn_depth;
+			if (Bt(&agent->agent_flags, AGENTf_CAN_SPAWN))
+				" [spawn]";
+			if (Bt(&agent->agent_flags, AGENTf_HEALING))
+				" [healing]";
+			"\n";
+		}
+	}
+	"  System pain: %.2f  Load: %.2f\n",
+		kernel_state.system_pain, kernel_state.system_load;
+	"  Slots GPU: %d/%d  CPU: %d/%d  IO: %d/%d\n",
+		kernel_state.slots.used[SLOT_TYPE_GPU], kernel_state.slots.total[SLOT_TYPE_GPU],
+		kernel_state.slots.used[SLOT_TYPE_CPU], kernel_state.slots.total[SLOT_TYPE_CPU],
+		kernel_state.slots.used[SLOT_TYPE_IO], kernel_state.slots.total[SLOT_TYPE_IO];
+}
